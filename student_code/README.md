@@ -13,6 +13,8 @@ QMT-DETR 在 Moment-DETR 投影层之后、视频文本拼接之前加入：
 
 后续受控变体 `cross-neg-query` 保留第 1、2 项并移除多尺度与同视频困难背景损失。训练时将文本沿 batch 维循环移位，构造视频—查询错配，并约束正确配对的标注显著 clip 均值至少比错配查询下所有有效 clip 的最高分高 0.2。该项权重为 0.1；batch size 为 1 时自动跳过。推理路径与候选导出接口不变。
 
+`cross-trcc` 同样以仅 Cross 为骨架，利用预测 span 内部的 saliency 均值以及内部—邻接上下文环的 saliency 差，对最终层 proposal 的前景 logit 做 Task-Reciprocal Confidence Calibration。两个可学习标量系数均以 0 初始化，因此初始输出与仅 Cross 完全相同。软区间温度默认 0.02，上下文环外边界为预测宽度的 2 倍；span 在生成软掩码时停止梯度，校准不会反向扰动边界回归。padding clip 始终从统计中排除，辅助 decoder 层不参与校准。
+
 模型配置随 checkpoint 保存，`qmt/export_candidates.py` 只接受 QMT checkpoint，并以 `strict=True` 重载参数。正式 A 实验沿用 40 epoch、batch 32、学习率 `1e-4`、每 5 epoch 评估以及种子 42/2026/3407。
 
 ILR-QLoRA 读取固定的 `data/reference_full/sft_pairwise.jsonl`。每个固定二候选对分别进行 pointwise 前向，使用第一个监督答案 token 之前的
@@ -33,7 +35,7 @@ PYTHONPATH=$PWD:$PWD/scripts:$PWD/upstream/moment_detr \
   student_code/tests/run_quick_checks.py
 ```
 
-检查范围包括 ILR 分数位置与梯度方向、C-off 的零辅助损失、QMT 新参数更新，以及 QMT 严格保存/重载后的完整预测一致性。该检查不读取训练数据，也不加载 Qwen 模型。
+检查范围包括 ILR 分数位置与梯度方向、C-off 的零辅助损失、QMT 新参数更新、TRCC 零初始化/掩码/梯度隔离，以及 QMT 严格保存/重载后的完整预测一致性。该检查不读取训练数据，也不加载 Qwen 模型。
 
 ## A 正式训练
 
@@ -63,9 +65,10 @@ bash student_code/scripts/run_qmt_queue.sh <cuda-ordinal> cross 42 2026 3407
 bash student_code/scripts/run_qmt_queue.sh <cuda-ordinal> cross-multiscale 42 2026 3407
 bash student_code/scripts/run_qmt_queue.sh <cuda-ordinal> off-multiscale 42 2026 3407
 bash student_code/scripts/run_qmt_queue.sh <cuda-ordinal> cross-neg-query 42 2026 3407
+bash student_code/scripts/run_qmt_queue.sh <cuda-ordinal> cross-trcc 42 2026 3407
 ```
 
-其中 `cross` 仅启用交叉注意力，`cross-multiscale` 再加入多尺度分支，`off-multiscale` 从完整方法中移除多尺度分支但保留困难负样本损失，`cross-neg-query` 在仅 Cross 骨架上加入 Negative-query Saliency Calibration。新校准项默认系数为 `0.1`、margin 为 `0.2`；batch size 小于 2 时自动跳过。
+其中 `cross` 仅启用交叉注意力，`cross-multiscale` 再加入多尺度分支，`off-multiscale` 从完整方法中移除多尺度分支但保留困难负样本损失，`cross-neg-query` 在仅 Cross 骨架上加入 Negative-query Saliency Calibration；`cross-trcc` 在仅 Cross 骨架上用 span 内部与邻接上下文 saliency 校准最终 proposal 置信度。Negative-query 项默认系数为 `0.1`、margin 为 `0.2`；batch size 小于 2 时自动跳过。
 
 选定配置后导出候选：
 

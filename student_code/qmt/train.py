@@ -60,6 +60,9 @@ def parse_args():
     parser.add_argument("--qmt-negative-query", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--qmt-negative-query-coef", type=float, default=0.1)
     parser.add_argument("--qmt-negative-query-margin", type=float, default=0.2)
+    parser.add_argument("--qmt-trcc", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--qmt-trcc-temperature", type=float, default=0.02)
+    parser.add_argument("--qmt-trcc-context-scale", type=float, default=2.0)
     return parser.parse_args()
 
 
@@ -78,6 +81,9 @@ def qmt_model_config(args):
         qmt_negative_query=args.qmt_negative_query,
         qmt_negative_query_coef=args.qmt_negative_query_coef,
         qmt_negative_query_margin=args.qmt_negative_query_margin,
+        qmt_trcc=args.qmt_trcc,
+        qmt_trcc_temperature=args.qmt_trcc_temperature,
+        qmt_trcc_context_scale=args.qmt_trcc_context_scale,
     )
     return config
 
@@ -103,8 +109,8 @@ def main():
     from torch.utils.data import DataLoader
     from moment_detr.start_end_dataset import start_end_collate, prepare_batch_inputs
 
-    if args.qmt_multiscale and not args.qmt_cross_attn:
-        raise ValueError("--qmt-multiscale requires --qmt-cross-attn")
+    if (args.qmt_multiscale or args.qmt_trcc) and not args.qmt_cross_attn:
+        raise ValueError("--qmt-multiscale and --qmt-trcc require --qmt-cross-attn")
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA unavailable")

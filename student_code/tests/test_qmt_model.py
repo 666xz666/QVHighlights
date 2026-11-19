@@ -114,6 +114,73 @@ def test_cyclic_mismatch_rotates_text_only_and_skips_singletons():
     assert train_qmt_locator.make_cyclic_mismatch(singleton) is None
 
 
+def test_trcc_zero_init_is_identity_and_checkpoint_reloadable():
+    model, _ = build_qmt_model(qmt_config(
+        qmt_multiscale=False, qmt_hard_negative=False, qmt_trcc=True,
+        qmt_trcc_temperature=0.02, qmt_trcc_context_scale=2.0,
+    ))
+    logits = torch.randn(2, 3, 2)
+    spans = torch.rand(2, 3, 2)
+    saliency = torch.randn(2, 5)
+    video_mask = torch.tensor([[1, 1, 1, 1, 1], [1, 1, 1, 0, 0]])
+    actual = model._calibrate_logits(logits, spans, saliency, video_mask)
+    torch.testing.assert_close(actual, logits, rtol=0.0, atol=0.0)
+
+    restored, _ = build_qmt_model(qmt_config(
+        qmt_multiscale=False, qmt_hard_negative=False, qmt_trcc=True,
+        qmt_trcc_temperature=0.02, qmt_trcc_context_scale=2.0,
+    ))
+    model.qmt_trcc_alpha.data.fill_(0.4)
+    model.qmt_trcc_beta.data.fill_(0.2)
+    restored.load_state_dict(model.state_dict(), strict=True)
+    assert restored.qmt_trcc_alpha.item() == model.qmt_trcc_alpha.item()
+    assert restored.qmt_trcc_beta.item() == model.qmt_trcc_beta.item()
+
+    model.eval()
+    restored.eval()
+    config = qmt_config()
+    raw_video = torch.randn(2, 5, config.v_feat_dim)
+    raw_text = torch.randn(2, 3, config.t_feat_dim)
+    text_mask = torch.tensor([[1, 1, 1], [1, 1, 0]])
+    with torch.inference_mode():
+        expected = model(raw_text, text_mask, raw_video, video_mask)
+        actual = restored(raw_text, text_mask, raw_video, video_mask)
+    for key in ("pred_logits", "pred_spans", "saliency_scores"):
+        torch.testing.assert_close(actual[key], expected[key])
+
+
+def test_trcc_ignores_padded_saliency():
+    model, _ = build_qmt_model(qmt_config(
+        qmt_multiscale=False, qmt_hard_negative=False, qmt_trcc=True,
+    ))
+    model.qmt_trcc_alpha.data.fill_(0.7)
+    model.qmt_trcc_beta.data.fill_(0.3)
+    logits = torch.zeros(1, 1, 2)
+    spans = torch.tensor([[[0.5, 0.5]]])
+    mask = torch.tensor([[1, 1, 1, 1, 0, 0]])
+    base = torch.tensor([[0.0, 2.0, 2.0, 0.0, -10.0, -10.0]])
+    changed_padding = base.clone()
+    changed_padding[:, 4:] = 1e4
+    expected = model._calibrate_logits(logits, spans, base, mask)
+    actual = model._calibrate_logits(logits, spans, changed_padding, mask)
+    torch.testing.assert_close(actual, expected)
+
+
+def test_trcc_gradient_updates_calibration_without_span_gradient():
+    model, _ = build_qmt_model(qmt_config(
+        qmt_multiscale=False, qmt_hard_negative=False, qmt_trcc=True,
+    ))
+    logits = torch.zeros(1, 1, 2)
+    spans = torch.tensor([[[0.5, 0.5]]], requires_grad=True)
+    saliency = torch.tensor([[0.0, 2.0, 2.0, 0.0]])
+    mask = torch.ones(1, 4, dtype=torch.bool)
+    calibrated = model._calibrate_logits(logits, spans, saliency, mask)
+    (-calibrated[..., 0].mean()).backward()
+    assert model.qmt_trcc_alpha.grad.item() < 0.0
+    assert model.qmt_trcc_beta.grad.item() < 0.0
+    assert spans.grad is None
+
+
 def test_qmt_dev_evaluation_uses_row_contract_and_brief_map():
     predictions = [{"qid": 1}]
     dev_rows = [{"qid": 1}]

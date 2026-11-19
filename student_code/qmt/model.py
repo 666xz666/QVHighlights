@@ -16,13 +16,22 @@ class QMTDETR(MomentDETR):
 
     def __init__(self, *args, qmt_cross_attn=False, qmt_multiscale=False,
                  qmt_num_heads=8, qmt_dilations=(1, 2, 4),
-                 qmt_gate_bias=-2.0, **kwargs):
+                 qmt_gate_bias=-2.0, qmt_trcc=False,
+                 qmt_trcc_temperature=0.02, qmt_trcc_context_scale=2.0,
+                 **kwargs):
         super().__init__(*args, **kwargs)
         hidden_dim = self.transformer.d_model
         self.qmt_cross_attn = qmt_cross_attn
         self.qmt_multiscale = qmt_multiscale
-        if qmt_multiscale and not qmt_cross_attn:
-            raise ValueError("QMT multi-scale refinement requires query cross-attention")
+        self.qmt_trcc = qmt_trcc
+        self.qmt_trcc_temperature = qmt_trcc_temperature
+        self.qmt_trcc_context_scale = qmt_trcc_context_scale
+        if (qmt_multiscale or qmt_trcc) and not qmt_cross_attn:
+            raise ValueError("QMT refinements require query cross-attention")
+        if qmt_trcc_temperature <= 0:
+            raise ValueError("TRCC temperature must be positive")
+        if qmt_trcc_context_scale <= 1:
+            raise ValueError("TRCC context scale must be greater than one")
         if qmt_cross_attn:
             if hidden_dim % qmt_num_heads:
                 raise ValueError("QMT attention heads must divide the hidden dimension")
@@ -43,6 +52,10 @@ class QMTDETR(MomentDETR):
             # Identity initialization prevents a large perturbation at step zero.
             nn.init.zeros_(self.qmt_temporal_out.weight)
             nn.init.zeros_(self.qmt_temporal_out.bias)
+        if qmt_trcc:
+            # Zero initialization makes TRCC exactly identical to Cross at step zero.
+            self.qmt_trcc_alpha = nn.Parameter(torch.zeros(()))
+            self.qmt_trcc_beta = nn.Parameter(torch.zeros(()))
 
     @staticmethod
     def _masked_text_mean(src_txt, src_txt_mask):
@@ -88,6 +101,53 @@ class QMTDETR(MomentDETR):
             refined = refined + self.qmt_temporal_out(mixed)
         return refined * src_vid_mask.to(refined.dtype).unsqueeze(-1)
 
+    def _calibrate_logits(self, logits, spans, saliency_scores, video_mask):
+        """Calibrate foreground confidence from span-interior and ring saliency.
+
+        Args:
+            logits: Proposal class logits, shape ``[B, Q, 2]``.
+            spans: Normalized center-width proposals, shape ``[B, Q, 2]``.
+            saliency_scores: Per-clip saliency logits, shape ``[B, L_v]``.
+            video_mask: Valid-clip mask, shape ``[B, L_v]``.
+
+        Returns:
+            Calibrated logits with the same shape. Span coordinates are detached
+            while forming soft masks, so this branch does not alter span regression.
+        """
+        valid = video_mask.bool()
+        valid_float = valid.to(saliency_scores.dtype)
+        valid_lengths = valid_float.sum(1, keepdim=True).clamp_min(1.0)
+        positions = (valid_float.cumsum(1) - 0.5) / valid_lengths
+        positions = positions[:, None, :]
+        centers, widths = spans.detach().unbind(-1)
+        half_width = widths.clamp_min(0.0) / 2
+        temperature = self.qmt_trcc_temperature
+
+        def soft_interval(left, right):
+            return (
+                torch.sigmoid((positions - left[..., None]) / temperature)
+                * torch.sigmoid((right[..., None] - positions) / temperature)
+                * valid_float[:, None, :]
+            )
+
+        inside = soft_interval(centers - half_width, centers + half_width)
+        outer_half_width = half_width * self.qmt_trcc_context_scale
+        outer = soft_interval(centers - outer_half_width, centers + outer_half_width)
+        context = (outer - inside).clamp_min(0.0)
+
+        scores = saliency_scores[:, None, :]
+        inside_mean = (scores * inside).sum(-1) / inside.sum(-1).clamp_min(1e-6)
+        context_mass = context.sum(-1)
+        context_mean = (scores * context).sum(-1) / context_mass.clamp_min(1e-6)
+        context_mean = torch.where(context_mass > 1e-6, context_mean, inside_mean)
+        correction = (
+            self.qmt_trcc_alpha * inside_mean
+            + self.qmt_trcc_beta * (inside_mean - context_mean)
+        )
+        calibrated = logits.clone()
+        calibrated[..., 0] = calibrated[..., 0] + correction
+        return calibrated
+
     def forward(self, src_txt, src_txt_mask, src_vid, src_vid_mask):
         """Run QMT-DETR with the same input/output contract as Moment-DETR."""
         src_vid = self.input_vid_proj(src_vid)
@@ -105,16 +165,22 @@ class QMTDETR(MomentDETR):
         outputs_coord = self.span_embed(hs)
         if self.span_loss_type == "l1":
             outputs_coord = outputs_coord.sigmoid()
-        out = {"pred_logits": outputs_class[-1], "pred_spans": outputs_coord[-1]}
         txt_mem = memory[:, src_vid.shape[1]:]
         vid_mem = memory[:, :src_vid.shape[1]]
+        saliency_scores = self.saliency_proj(vid_mem).squeeze(-1)
+        final_logits = outputs_class[-1]
+        if self.qmt_trcc:
+            final_logits = self._calibrate_logits(
+                final_logits, outputs_coord[-1], saliency_scores, src_vid_mask,
+            )
+        out = {"pred_logits": final_logits, "pred_spans": outputs_coord[-1]}
         if self.contrastive_align_loss:
             proj_queries = F.normalize(self.contrastive_align_projection_query(hs), p=2, dim=-1)
             proj_txt_mem = F.normalize(self.contrastive_align_projection_txt(txt_mem), p=2, dim=-1)
             proj_vid_mem = F.normalize(self.contrastive_align_projection_vid(vid_mem), p=2, dim=-1)
             out.update(proj_queries=proj_queries[-1], proj_txt_mem=proj_txt_mem,
                        proj_vid_mem=proj_vid_mem)
-        out["saliency_scores"] = self.saliency_proj(vid_mem).squeeze(-1)
+        out["saliency_scores"] = saliency_scores
         out["video_mask"] = src_vid_mask.bool()
         if self.aux_loss:
             out["aux_outputs"] = [
@@ -222,6 +288,9 @@ def build_qmt_model(args):
         qmt_num_heads=getattr(args, "qmt_num_heads", 8),
         qmt_dilations=getattr(args, "qmt_dilations", (1, 2, 4)),
         qmt_gate_bias=getattr(args, "qmt_gate_bias", -2.0),
+        qmt_trcc=getattr(args, "qmt_trcc", False),
+        qmt_trcc_temperature=getattr(args, "qmt_trcc_temperature", 0.02),
+        qmt_trcc_context_scale=getattr(args, "qmt_trcc_context_scale", 2.0),
     )
     weight_dict = {
         "loss_span": args.span_loss_coef, "loss_giou": args.giou_loss_coef,

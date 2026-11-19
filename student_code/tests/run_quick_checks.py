@@ -16,6 +16,9 @@ def main():
         qmt.test_hard_negative_margin_uses_gt_interior_and_exterior,
         qmt.test_negative_query_margin_uses_all_valid_mismatched_clips,
         qmt.test_cyclic_mismatch_rotates_text_only_and_skips_singletons,
+        qmt.test_trcc_zero_init_is_identity_and_checkpoint_reloadable,
+        qmt.test_trcc_ignores_padded_saliency,
+        qmt.test_trcc_gradient_updates_calibration_without_span_gradient,
         qmt.test_qmt_dev_evaluation_uses_row_contract_and_brief_map,
     ]
     for check in checks:

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Usage: bash student_code/scripts/run_qmt_queue.sh <cuda-ordinal> <full|cross|cross-multiscale|off-multiscale|cross-neg-query> <seed> [seed ...]
+# Usage: bash student_code/scripts/run_qmt_queue.sh <cuda-ordinal> <full|cross|cross-multiscale|off-multiscale|cross-neg-query|cross-trcc> <seed> [seed ...]
 set -euo pipefail
 
 CUDA_ORDINAL=${1:?CUDA ordinal required}
@@ -12,6 +12,7 @@ case "$VARIANT" in
   cross-multiscale) FLAGS=(--no-qmt-hard-negative) ;;
   off-multiscale) FLAGS=(--no-qmt-multiscale) ;;
   cross-neg-query) FLAGS=(--no-qmt-multiscale --no-qmt-hard-negative --qmt-negative-query) ;;
+  cross-trcc) FLAGS=(--no-qmt-multiscale --no-qmt-hard-negative --qmt-trcc) ;;
   *) echo "Unknown variant: $VARIANT" >&2; exit 2 ;;
 esac
 
