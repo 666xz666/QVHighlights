@@ -19,6 +19,8 @@ def main():
         qmt.test_trcc_zero_init_is_identity_and_checkpoint_reloadable,
         qmt.test_trcc_ignores_padded_saliency,
         qmt.test_trcc_gradient_updates_calibration_without_span_gradient,
+        qmt.test_bridge_loss_aligns_inside_and_rejects_outside_without_padding,
+        qmt.test_bridge_forward_exposes_normalized_embeddings_and_is_reloadable,
         qmt.test_qmt_dev_evaluation_uses_row_contract_and_brief_map,
     ]
     for check in checks:

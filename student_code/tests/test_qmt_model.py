@@ -15,6 +15,8 @@ def qmt_config(**overrides):
         qmt_hard_negative_coef=0.1, qmt_hard_negative_margin=0.2,
         qmt_negative_query=False, qmt_negative_query_coef=0.1,
         qmt_negative_query_margin=0.2,
+        qmt_trcc=False, qmt_trcc_temperature=0.02, qmt_trcc_context_scale=2.0,
+        qmt_bridge=False, qmt_bridge_coef=0.1, qmt_bridge_temperature=0.07,
     )
     config.update(overrides)
     return SimpleNamespace(**config)
@@ -179,6 +181,55 @@ def test_trcc_gradient_updates_calibration_without_span_gradient():
     assert model.qmt_trcc_alpha.grad.item() < 0.0
     assert model.qmt_trcc_beta.grad.item() < 0.0
     assert spans.grad is None
+
+
+def test_bridge_loss_aligns_inside_and_rejects_outside_without_padding():
+    _, criterion = build_qmt_model(qmt_config(
+        qmt_multiscale=False, qmt_hard_negative=False, qmt_bridge=True,
+    ))
+    queries = torch.tensor([[[1.0, 0.0], [0.0, 1.0]]], requires_grad=True)
+    frames = torch.tensor(
+        [[[1.0, 0.0], [1.0, 0.0], [-1.0, 0.0], [999.0, 999.0]]],
+        requires_grad=True,
+    )
+    outputs = {
+        "bridge_queries": queries,
+        "bridge_vid_mem": frames,
+        "video_mask": torch.tensor([[1, 1, 1, 0]], dtype=torch.bool),
+    }
+    targets = {"span_labels": [{"spans": torch.tensor([[0.25, 0.5]])}]}
+    indices = [(torch.tensor([0]), torch.tensor([0]))]
+    loss = criterion.loss_qmt_bridge(outputs, targets, indices)
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert queries.grad is not None
+    assert frames.grad[0, 0, 0].item() < 0.0
+    assert frames.grad[0, 2, 0].item() > 0.0
+    assert frames.grad[0, 3].abs().sum().item() == 0.0
+
+
+def test_bridge_forward_exposes_normalized_embeddings_and_is_reloadable():
+    config = qmt_config(
+        qmt_multiscale=False, qmt_hard_negative=False, qmt_bridge=True,
+    )
+    model, _ = build_qmt_model(config)
+    restored, _ = build_qmt_model(config)
+    restored.load_state_dict(model.state_dict(), strict=True)
+    model.eval()
+    restored.eval()
+    video = torch.randn(2, 5, config.v_feat_dim)
+    text = torch.randn(2, 3, config.t_feat_dim)
+    video_mask = torch.tensor([[1, 1, 1, 1, 1], [1, 1, 1, 0, 0]])
+    text_mask = torch.tensor([[1, 1, 1], [1, 1, 0]])
+    with torch.inference_mode():
+        expected = model(text, text_mask, video, video_mask)
+        actual = restored(text, text_mask, video, video_mask)
+    for key in ("pred_logits", "pred_spans", "bridge_queries", "bridge_vid_mem"):
+        torch.testing.assert_close(actual[key], expected[key])
+    torch.testing.assert_close(
+        expected["bridge_queries"].norm(dim=-1),
+        torch.ones_like(expected["bridge_queries"][..., 0]), atol=1e-5, rtol=1e-5,
+    )
 
 
 def test_qmt_dev_evaluation_uses_row_contract_and_brief_map():

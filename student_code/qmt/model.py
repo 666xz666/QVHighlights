@@ -18,15 +18,17 @@ class QMTDETR(MomentDETR):
                  qmt_num_heads=8, qmt_dilations=(1, 2, 4),
                  qmt_gate_bias=-2.0, qmt_trcc=False,
                  qmt_trcc_temperature=0.02, qmt_trcc_context_scale=2.0,
+                 qmt_bridge=False,
                  **kwargs):
         super().__init__(*args, **kwargs)
         hidden_dim = self.transformer.d_model
         self.qmt_cross_attn = qmt_cross_attn
         self.qmt_multiscale = qmt_multiscale
         self.qmt_trcc = qmt_trcc
+        self.qmt_bridge = qmt_bridge
         self.qmt_trcc_temperature = qmt_trcc_temperature
         self.qmt_trcc_context_scale = qmt_trcc_context_scale
-        if (qmt_multiscale or qmt_trcc) and not qmt_cross_attn:
+        if (qmt_multiscale or qmt_trcc or qmt_bridge) and not qmt_cross_attn:
             raise ValueError("QMT refinements require query cross-attention")
         if qmt_trcc_temperature <= 0:
             raise ValueError("TRCC temperature must be positive")
@@ -182,6 +184,10 @@ class QMTDETR(MomentDETR):
                        proj_vid_mem=proj_vid_mem)
         out["saliency_scores"] = saliency_scores
         out["video_mask"] = src_vid_mask.bool()
+        if self.qmt_bridge:
+            # 最终层 query 与 encoder clip 位于同一隐藏空间；归一化后只监督方向相似度。
+            out["bridge_queries"] = F.normalize(hs[-1], p=2, dim=-1)
+            out["bridge_vid_mem"] = F.normalize(vid_mem, p=2, dim=-1)
         if self.aux_loss:
             out["aux_outputs"] = [
                 {"pred_logits": logits, "pred_spans": spans}
@@ -201,12 +207,17 @@ class QMTSetCriterion(SetCriterion):
     def __init__(self, *args, qmt_hard_negative=False,
                  qmt_hard_negative_margin=0.2,
                  qmt_negative_query=False,
-                 qmt_negative_query_margin=0.2, **kwargs):
+                 qmt_negative_query_margin=0.2,
+                 qmt_bridge=False, qmt_bridge_temperature=0.07, **kwargs):
         super().__init__(*args, **kwargs)
         self.qmt_hard_negative = qmt_hard_negative
         self.qmt_hard_negative_margin = qmt_hard_negative_margin
         self.qmt_negative_query = qmt_negative_query
         self.qmt_negative_query_margin = qmt_negative_query_margin
+        self.qmt_bridge = qmt_bridge
+        self.qmt_bridge_temperature = qmt_bridge_temperature
+        if qmt_bridge_temperature <= 0:
+            raise ValueError("Bridge temperature must be positive")
 
     def loss_qmt_hard_negative(self, outputs, targets):
         """Contrast GT-interior saliency with the strongest exterior clip."""
@@ -263,10 +274,59 @@ class QMTSetCriterion(SetCriterion):
             + strongest_mismatch[valid_rows]
         ).mean()
 
+    def loss_qmt_bridge(self, outputs, targets, indices):
+        """Align each matched decoder query with clips inside its GT span.
+
+        Args:
+            outputs: 最终层输出，含归一化 query、video memory 与有效 clip 掩码。
+            targets: 基线 prepare_batch_inputs 生成的训练目标。
+            indices: Hungarian matcher 返回的逐样本 (query_idx, target_idx)。
+
+        Returns:
+            区间内、外二项等权的标量 logistic loss。padding clip 不参与监督。
+        """
+        queries = outputs["bridge_queries"]
+        frames = outputs["bridge_vid_mem"]
+        video_mask = outputs["video_mask"].bool()
+        pair_losses = []
+        for batch_index, (query_indices, target_indices) in enumerate(indices):
+            valid_length = int(video_mask[batch_index].sum())
+            if valid_length == 0:
+                continue
+            positions = (
+                torch.arange(valid_length, device=queries.device, dtype=queries.dtype) + 0.5
+            ) / valid_length
+            target_spans = targets["span_labels"][batch_index]["spans"][target_indices]
+            target_spans = target_spans.to(device=queries.device, dtype=queries.dtype)
+            for query_index, target_span in zip(query_indices, target_spans):
+                center, width = target_span.unbind(0)
+                inside = (positions >= center - width / 2) & (positions <= center + width / 2)
+                # 极窄标注仍对齐到最近 clip，避免该正匹配没有局部监督。
+                if not inside.any():
+                    inside[(positions - center).abs().argmin()] = True
+                logits = torch.matmul(
+                    frames[batch_index, :valid_length], queries[batch_index, query_index],
+                ) / self.qmt_bridge_temperature
+                inside_loss = F.softplus(-logits[inside]).mean()
+                outside = ~inside
+                outside_loss = (
+                    F.softplus(logits[outside]).mean() if outside.any()
+                    else logits.sum() * 0.0
+                )
+                pair_losses.append(inside_loss + outside_loss)
+        return torch.stack(pair_losses).mean() if pair_losses else queries.sum() * 0.0
+
     def forward(self, outputs, targets):
         losses = super().forward(outputs, targets)
         if self.qmt_hard_negative:
             losses["loss_qmt_hard_negative"] = self.loss_qmt_hard_negative(outputs, targets)
+        if self.qmt_bridge:
+            # 基线 criterion 不暴露匹配索引；仅为最终层重复一次轻量 Hungarian 匹配。
+            outputs_without_aux = {
+                key: value for key, value in outputs.items() if key != "aux_outputs"
+            }
+            indices = self.matcher(outputs_without_aux, targets)
+            losses["loss_qmt_bridge"] = self.loss_qmt_bridge(outputs, targets, indices)
         return losses
 
 
@@ -291,6 +351,7 @@ def build_qmt_model(args):
         qmt_trcc=getattr(args, "qmt_trcc", False),
         qmt_trcc_temperature=getattr(args, "qmt_trcc_temperature", 0.02),
         qmt_trcc_context_scale=getattr(args, "qmt_trcc_context_scale", 2.0),
+        qmt_bridge=getattr(args, "qmt_bridge", False),
     )
     weight_dict = {
         "loss_span": args.span_loss_coef, "loss_giou": args.giou_loss_coef,
@@ -302,12 +363,14 @@ def build_qmt_model(args):
         weight_dict["loss_qmt_hard_negative"] = getattr(args, "qmt_hard_negative_coef", 0.1)
     if getattr(args, "qmt_negative_query", False):
         weight_dict["loss_qmt_negative_query"] = getattr(args, "qmt_negative_query_coef", 0.1)
+    if getattr(args, "qmt_bridge", False):
+        weight_dict["loss_qmt_bridge"] = getattr(args, "qmt_bridge_coef", 0.1)
     if args.aux_loss:
         for index in range(args.dec_layers - 1):
             weight_dict.update({
                 key + f"_{index}": value for key, value in list(weight_dict.items())
                 if key not in {"loss_saliency", "loss_qmt_hard_negative",
-                               "loss_qmt_negative_query"}
+                               "loss_qmt_negative_query", "loss_qmt_bridge"}
                 and not key.rsplit("_", 1)[-1].isdigit()
             })
     losses = ["spans", "labels", "saliency"]
@@ -322,6 +385,8 @@ def build_qmt_model(args):
         qmt_hard_negative_margin=getattr(args, "qmt_hard_negative_margin", 0.2),
         qmt_negative_query=getattr(args, "qmt_negative_query", False),
         qmt_negative_query_margin=getattr(args, "qmt_negative_query_margin", 0.2),
+        qmt_bridge=getattr(args, "qmt_bridge", False),
+        qmt_bridge_temperature=getattr(args, "qmt_bridge_temperature", 0.07),
     )
     criterion.to(device)
     return model, criterion

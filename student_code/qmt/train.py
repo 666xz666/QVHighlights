@@ -63,6 +63,9 @@ def parse_args():
     parser.add_argument("--qmt-trcc", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--qmt-trcc-temperature", type=float, default=0.02)
     parser.add_argument("--qmt-trcc-context-scale", type=float, default=2.0)
+    parser.add_argument("--qmt-bridge", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--qmt-bridge-coef", type=float, default=0.1)
+    parser.add_argument("--qmt-bridge-temperature", type=float, default=0.07)
     return parser.parse_args()
 
 
@@ -84,6 +87,9 @@ def qmt_model_config(args):
         qmt_trcc=args.qmt_trcc,
         qmt_trcc_temperature=args.qmt_trcc_temperature,
         qmt_trcc_context_scale=args.qmt_trcc_context_scale,
+        qmt_bridge=args.qmt_bridge,
+        qmt_bridge_coef=args.qmt_bridge_coef,
+        qmt_bridge_temperature=args.qmt_bridge_temperature,
     )
     return config
 
@@ -109,8 +115,10 @@ def main():
     from torch.utils.data import DataLoader
     from moment_detr.start_end_dataset import start_end_collate, prepare_batch_inputs
 
-    if (args.qmt_multiscale or args.qmt_trcc) and not args.qmt_cross_attn:
-        raise ValueError("--qmt-multiscale and --qmt-trcc require --qmt-cross-attn")
+    if (args.qmt_multiscale or args.qmt_trcc or args.qmt_bridge) and not args.qmt_cross_attn:
+        raise ValueError("QMT refinements require --qmt-cross-attn")
+    if args.qmt_bridge_temperature <= 0:
+        raise ValueError("--qmt-bridge-temperature must be positive")
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA unavailable")
