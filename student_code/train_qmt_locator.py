@@ -1,0 +1,175 @@
+#!/usr/bin/env python3
+"""Train QMT-DETR on the course split and select by dev mAP@3."""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+from pathlib import Path
+import random
+import sys
+import time
+from types import SimpleNamespace
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path[:0] = [str(ROOT / "scripts"), str(ROOT / "upstream" / "moment_detr"), str(ROOT)]
+
+from evaluate import evaluate
+from locator_common import (audit_features, discover_features, dump_json, make_dataset,
+                            model_config, predict)
+from prepare_course_data import assert_disjoint, read_jsonl, source_id, write_jsonl
+from student_code.qmt_model import build_qmt_model
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--feature-root", required=True)
+    parser.add_argument("--train-annotations", required=True)
+    parser.add_argument("--dev-annotations", required=True)
+    parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--seed", type=int, required=True, choices=[42, 2026, 3407])
+    parser.add_argument("--epochs", type=int, default=40)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--eval-every", type=int, default=5)
+    parser.add_argument("--device", default="cuda", choices=["cuda", "cpu"])
+    parser.add_argument("--qmt-cross-attn", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--qmt-multiscale", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--qmt-hard-negative", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--qmt-num-heads", type=int, default=8)
+    parser.add_argument("--qmt-dilations", type=int, nargs="+", default=[1, 2, 4])
+    parser.add_argument("--qmt-gate-bias", type=float, default=-2.0)
+    parser.add_argument("--qmt-hard-negative-coef", type=float, default=0.1)
+    parser.add_argument("--qmt-hard-negative-margin", type=float, default=0.2)
+    return parser.parse_args()
+
+
+def qmt_model_config(args):
+    """Return the complete reloadable architecture configuration."""
+    config = model_config(args.device)
+    config.update(
+        qmt_cross_attn=args.qmt_cross_attn,
+        qmt_multiscale=args.qmt_multiscale,
+        qmt_hard_negative=args.qmt_hard_negative,
+        qmt_num_heads=args.qmt_num_heads,
+        qmt_dilations=tuple(args.qmt_dilations),
+        qmt_gate_bias=args.qmt_gate_bias,
+        qmt_hard_negative_coef=args.qmt_hard_negative_coef,
+        qmt_hard_negative_margin=args.qmt_hard_negative_margin,
+    )
+    return config
+
+
+def evaluate_dev_predictions(predictions, dev_rows):
+    """按课程评测器的行列表契约计算 dev 指标与选模 mAP。
+
+    Args:
+        predictions (list[dict]): 每个查询恰含三个候选窗口的预测行。
+        dev_rows (list[dict]): dev 标注行，与预测的 qid 集合一致。
+
+    Returns:
+        tuple[dict, float]: 完整评测结果与用于 checkpoint 选择的 MR-full-mAP。
+    """
+    metrics = evaluate(predictions, dev_rows)
+    return metrics, float(metrics["brief"]["MR-full-mAP"])
+
+
+def main():
+    args = parse_args()
+    import numpy as np
+    import torch
+    from torch.utils.data import DataLoader
+    from moment_detr.start_end_dataset import start_end_collate, prepare_batch_inputs
+
+    if args.qmt_multiscale and not args.qmt_cross_attn:
+        raise ValueError("--qmt-multiscale requires --qmt-cross-attn")
+    device = torch.device(args.device)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA unavailable")
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+
+    train_rows, dev_rows = read_jsonl(args.train_annotations), read_jsonl(args.dev_annotations)
+    assert_disjoint({"train": train_rows, "dev": dev_rows})
+    layout = discover_features(args.feature_root)
+    audit_features(layout, train_rows + dev_rows)
+    config = qmt_model_config(args)
+    train_set = make_dataset(args.train_annotations, layout, config, load_labels=True)
+    dev_set = make_dataset(args.dev_annotations, layout, config, load_labels=False)
+    generator = torch.Generator().manual_seed(args.seed)
+    train_loader = DataLoader(
+        train_set, batch_size=args.batch_size, shuffle=True, num_workers=args.workers,
+        collate_fn=start_end_collate, pin_memory=device.type == "cuda", generator=generator,
+    )
+    dev_loader = DataLoader(
+        dev_set, batch_size=args.batch_size, shuffle=False, num_workers=args.workers,
+        collate_fn=start_end_collate, pin_memory=device.type == "cuda",
+    )
+    model, criterion = build_qmt_model(SimpleNamespace(**config))
+    model.to(device)
+    trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    optimizer = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=args.weight_decay)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    train_qids = sorted(row["qid"] for row in train_rows)
+    train_source_ids = sorted({source_id(row["vid"]) for row in train_rows})
+    best_map, best_epoch = float("-inf"), None
+    log_path = output_dir / "train_log.jsonl"
+
+    def save_checkpoint(path, epoch, metrics):
+        torch.save({
+            "schema_version": 2,
+            "model_family": "qmt_detr",
+            "model": model.state_dict(), "epoch": epoch, "metrics": metrics,
+            "model_config": config, "seed": args.seed, "train_qids": train_qids,
+            "train_source_ids": train_source_ids,
+        }, path)
+
+    for epoch in range(1, args.epochs + 1):
+        model.train()
+        epoch_losses = []
+        start = time.time()
+        for batch in train_loader:
+            model_inputs, targets = prepare_batch_inputs(batch[1], device, non_blocking=True)
+            outputs = model(**model_inputs)
+            loss_dict = criterion(outputs, targets)
+            loss = sum(loss_dict[key] * criterion.weight_dict[key]
+                       for key in loss_dict if key in criterion.weight_dict)
+            if not torch.isfinite(loss):
+                raise RuntimeError(f"Non-finite loss at epoch {epoch}: {float(loss)}")
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(trainable, 0.1)
+            optimizer.step()
+            epoch_losses.append(float(loss.detach()))
+        record = {"epoch": epoch, "train_loss": sum(epoch_losses) / len(epoch_losses),
+                  "seconds": time.time() - start}
+        if epoch % args.eval_every == 0 or epoch == args.epochs:
+            prediction_path = output_dir / f"dev_predictions_epoch_{epoch}.jsonl"
+            predictions = predict(model, dev_loader, device, "dev")
+            write_jsonl(prediction_path, predictions)
+            metrics, current_map = evaluate_dev_predictions(predictions, dev_rows)
+            dump_json(output_dir / f"dev_metrics_epoch_{epoch}.json", metrics)
+            record["dev"] = metrics
+            if current_map > best_map:
+                best_map, best_epoch = current_map, epoch
+                save_checkpoint(output_dir / "model_best.pt", epoch, metrics)
+        with log_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        print(json.dumps(record, ensure_ascii=False), flush=True)
+    dump_json(output_dir / "summary.json", {
+        "seed": args.seed, "best_epoch": best_epoch, "best_dev_mAP": best_map,
+        "train_queries": len(train_rows), "dev_queries": len(dev_rows),
+        "train_annotation_sha256": hashlib.sha256(Path(args.train_annotations).read_bytes()).hexdigest(),
+        "dev_annotation_sha256": hashlib.sha256(Path(args.dev_annotations).read_bytes()).hexdigest(),
+        "model_config": config,
+    })
+
+
+if __name__ == "__main__":
+    main()
