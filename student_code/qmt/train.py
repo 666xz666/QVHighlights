@@ -66,6 +66,11 @@ def parse_args():
     parser.add_argument("--qmt-bridge", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--qmt-bridge-coef", type=float, default=0.1)
     parser.add_argument("--qmt-bridge-temperature", type=float, default=0.07)
+    parser.add_argument("--qmt-iou-rank", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--qmt-iou-rank-coef", type=float, default=0.2)
+    parser.add_argument("--qmt-iou-rank-margin", type=float, default=0.1)
+    parser.add_argument("--qmt-iou-pair-coef", type=float, default=0.5)
+    parser.add_argument("--qmt-iou-score-weight", type=float, default=0.5)
     return parser.parse_args()
 
 
@@ -90,6 +95,11 @@ def qmt_model_config(args):
         qmt_bridge=args.qmt_bridge,
         qmt_bridge_coef=args.qmt_bridge_coef,
         qmt_bridge_temperature=args.qmt_bridge_temperature,
+        qmt_iou_rank=args.qmt_iou_rank,
+        qmt_iou_rank_coef=args.qmt_iou_rank_coef,
+        qmt_iou_rank_margin=args.qmt_iou_rank_margin,
+        qmt_iou_pair_coef=args.qmt_iou_pair_coef,
+        qmt_iou_score_weight=args.qmt_iou_score_weight,
     )
     return config
 
@@ -115,10 +125,14 @@ def main():
     from torch.utils.data import DataLoader
     from moment_detr.start_end_dataset import start_end_collate, prepare_batch_inputs
 
-    if (args.qmt_multiscale or args.qmt_trcc or args.qmt_bridge) and not args.qmt_cross_attn:
+    if (args.qmt_multiscale or args.qmt_trcc or args.qmt_bridge or args.qmt_iou_rank) and not args.qmt_cross_attn:
         raise ValueError("QMT refinements require --qmt-cross-attn")
     if args.qmt_bridge_temperature <= 0:
         raise ValueError("--qmt-bridge-temperature must be positive")
+    if args.qmt_iou_rank_coef < 0 or args.qmt_iou_pair_coef < 0:
+        raise ValueError("IoU ranking loss coefficients must be non-negative")
+    if args.qmt_iou_score_weight < 0:
+        raise ValueError("--qmt-iou-score-weight must be non-negative")
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA unavailable")

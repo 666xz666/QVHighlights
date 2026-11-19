@@ -21,6 +21,8 @@ def main():
         qmt.test_trcc_gradient_updates_calibration_without_span_gradient,
         qmt.test_bridge_loss_aligns_inside_and_rejects_outside_without_padding,
         qmt.test_bridge_forward_exposes_normalized_embeddings_and_is_reloadable,
+        qmt.test_iou_rank_loss_prefers_the_higher_overlap_query,
+        qmt.test_iou_rank_changes_eval_order_only_and_is_reloadable,
         qmt.test_qmt_dev_evaluation_uses_row_contract_and_brief_map,
     ]
     for check in checks:

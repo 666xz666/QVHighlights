@@ -17,6 +17,8 @@ QMT-DETR 在 Moment-DETR 投影层之后、视频文本拼接之前加入：
 
 `cross-bridge` 保留仅 Cross 骨架，在训练阶段将 Hungarian 匹配后的最终层 decoder query 与 GT 区间内 clip 对齐，并排斥区间外有效 clip。相似度采用归一化 query 与 encoder video memory 的余弦相似度，温度为 0.07；区间内、外 logistic loss 等权，避免长视频背景数量主导优化，padding clip 不参与监督。该项默认权重为 0.1，不改变推理路径或候选排序公式。
 
+`cross-iou-rank` 是 Sim-DETR Query Grouping and Ranking 的最小受控适配。质量头从停止梯度的最终 decoder query 预测每个 proposal 与 GT 的最大 IoU，以 soft-IoU BCE 和 IoU 差加权 RankNet 联合训练；仅质量头接收该项梯度，原 Cross 骨架及 Hungarian 匹配路径不变。评估时将 query 内中心化后的质量 logit 以权重 0.5 加到前景 logit，只改变候选相对排序。质量头末层零初始化，因此初始排序与仅 Cross 完全一致。
+
 模型配置随 checkpoint 保存，`qmt/export_candidates.py` 只接受 QMT checkpoint，并以 `strict=True` 重载参数。正式 A 实验沿用 40 epoch、batch 32、学习率 `1e-4`、每 5 epoch 评估以及种子 42/2026/3407。
 
 ILR-QLoRA 读取固定的 `data/reference_full/sft_pairwise.jsonl`。每个固定二候选对分别进行 pointwise 前向，使用第一个监督答案 token 之前的
@@ -69,9 +71,10 @@ bash student_code/scripts/run_qmt_queue.sh <cuda-ordinal> off-multiscale 42 2026
 bash student_code/scripts/run_qmt_queue.sh <cuda-ordinal> cross-neg-query 42 2026 3407
 bash student_code/scripts/run_qmt_queue.sh <cuda-ordinal> cross-trcc 42 2026 3407
 bash student_code/scripts/run_qmt_queue.sh <cuda-ordinal> cross-bridge 42 2026 3407
+bash student_code/scripts/run_qmt_queue.sh <cuda-ordinal> cross-iou-rank 42 2026 3407
 ```
 
-其中 `cross` 仅启用交叉注意力，`cross-multiscale` 再加入多尺度分支，`off-multiscale` 从完整方法中移除多尺度分支但保留困难负样本损失，`cross-neg-query` 在仅 Cross 骨架上加入 Negative-query Saliency Calibration；`cross-trcc` 在仅 Cross 骨架上用 span 内部与邻接上下文 saliency 校准最终 proposal 置信度；`cross-bridge` 用最终层匹配 query 对齐 GT 区间内 clip 并排斥区间外 clip。Negative-query 项默认系数为 `0.1`、margin 为 `0.2`；batch size 小于 2 时自动跳过。
+其中 `cross` 仅启用交叉注意力，`cross-multiscale` 再加入多尺度分支，`off-multiscale` 从完整方法中移除多尺度分支但保留困难负样本损失，`cross-neg-query` 在仅 Cross 骨架上加入 Negative-query Saliency Calibration；`cross-trcc` 在仅 Cross 骨架上用 span 内部与邻接上下文 saliency 校准最终 proposal 置信度；`cross-bridge` 用最终层匹配 query 对齐 GT 区间内 clip 并排斥区间外 clip；`cross-iou-rank` 预测 proposal IoU 并在评估时校准 query 排序。Negative-query 项默认系数为 `0.1`、margin 为 `0.2`；batch size 小于 2 时自动跳过。
 
 选定配置后导出候选：
 

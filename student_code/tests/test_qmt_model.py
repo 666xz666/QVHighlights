@@ -17,6 +17,8 @@ def qmt_config(**overrides):
         qmt_negative_query_margin=0.2,
         qmt_trcc=False, qmt_trcc_temperature=0.02, qmt_trcc_context_scale=2.0,
         qmt_bridge=False, qmt_bridge_coef=0.1, qmt_bridge_temperature=0.07,
+        qmt_iou_rank=False, qmt_iou_rank_coef=0.2, qmt_iou_rank_margin=0.1,
+        qmt_iou_pair_coef=0.5, qmt_iou_score_weight=0.5,
     )
     config.update(overrides)
     return SimpleNamespace(**config)
@@ -230,6 +232,39 @@ def test_bridge_forward_exposes_normalized_embeddings_and_is_reloadable():
         expected["bridge_queries"].norm(dim=-1),
         torch.ones_like(expected["bridge_queries"][..., 0]), atol=1e-5, rtol=1e-5,
     )
+
+
+def test_iou_rank_loss_prefers_the_higher_overlap_query():
+    _, criterion = build_qmt_model(qmt_config(
+        qmt_multiscale=False, qmt_hard_negative=False, qmt_iou_rank=True,
+    ))
+    quality_logits = torch.zeros(1, 2, requires_grad=True)
+    outputs = {
+        "qmt_iou_logits": quality_logits,
+        "pred_spans": torch.tensor([[[0.5, 0.4], [0.1, 0.1]]]),
+    }
+    targets = {"span_labels": [{"spans": torch.tensor([[0.5, 0.4]])}]}
+    loss = criterion.loss_qmt_iou_rank(outputs, targets)
+    loss.backward()
+    assert quality_logits.grad[0, 0].item() < 0.0
+    assert quality_logits.grad[0, 1].item() > 0.0
+    assert outputs["pred_spans"].grad is None
+
+
+def test_iou_rank_changes_eval_order_only_and_is_reloadable():
+    config = qmt_config(
+        qmt_multiscale=False, qmt_hard_negative=False, qmt_iou_rank=True,
+    )
+    model, _ = build_qmt_model(config)
+    base_logits = torch.zeros(1, 2, 2)
+    quality_logits = torch.tensor([[2.0, -2.0]])
+    ranked = model._apply_iou_ranking(base_logits, quality_logits)
+    assert ranked[0, 0, 0].item() > ranked[0, 1, 0].item()
+    torch.testing.assert_close(ranked[..., 1], base_logits[..., 1])
+
+    restored, _ = build_qmt_model(config)
+    restored.load_state_dict(model.state_dict(), strict=True)
+    assert restored.qmt_iou_score_weight == model.qmt_iou_score_weight
 
 
 def test_qmt_dev_evaluation_uses_row_contract_and_brief_map():

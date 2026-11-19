@@ -18,7 +18,8 @@ class QMTDETR(MomentDETR):
                  qmt_num_heads=8, qmt_dilations=(1, 2, 4),
                  qmt_gate_bias=-2.0, qmt_trcc=False,
                  qmt_trcc_temperature=0.02, qmt_trcc_context_scale=2.0,
-                 qmt_bridge=False,
+                 qmt_bridge=False, qmt_iou_rank=False,
+                 qmt_iou_score_weight=0.5,
                  **kwargs):
         super().__init__(*args, **kwargs)
         hidden_dim = self.transformer.d_model
@@ -26,9 +27,11 @@ class QMTDETR(MomentDETR):
         self.qmt_multiscale = qmt_multiscale
         self.qmt_trcc = qmt_trcc
         self.qmt_bridge = qmt_bridge
+        self.qmt_iou_rank = qmt_iou_rank
+        self.qmt_iou_score_weight = qmt_iou_score_weight
         self.qmt_trcc_temperature = qmt_trcc_temperature
         self.qmt_trcc_context_scale = qmt_trcc_context_scale
-        if (qmt_multiscale or qmt_trcc or qmt_bridge) and not qmt_cross_attn:
+        if (qmt_multiscale or qmt_trcc or qmt_bridge or qmt_iou_rank) and not qmt_cross_attn:
             raise ValueError("QMT refinements require query cross-attention")
         if qmt_trcc_temperature <= 0:
             raise ValueError("TRCC temperature must be positive")
@@ -58,6 +61,13 @@ class QMTDETR(MomentDETR):
             # Zero initialization makes TRCC exactly identical to Cross at step zero.
             self.qmt_trcc_alpha = nn.Parameter(torch.zeros(()))
             self.qmt_trcc_beta = nn.Parameter(torch.zeros(()))
+        if qmt_iou_rank:
+            self.qmt_iou_head = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, 1),
+            )
+            # 零初始化保证首次评估时所有 query 的排序与仅 Cross 完全一致。
+            nn.init.zeros_(self.qmt_iou_head[-1].weight)
+            nn.init.zeros_(self.qmt_iou_head[-1].bias)
 
     @staticmethod
     def _masked_text_mean(src_txt, src_txt_mask):
@@ -150,6 +160,22 @@ class QMTDETR(MomentDETR):
         calibrated[..., 0] = calibrated[..., 0] + correction
         return calibrated
 
+    def _apply_iou_ranking(self, logits, quality_logits):
+        """Use centered IoU quality to refine proposal order at evaluation.
+
+        Args:
+            logits: Proposal class logits, shape ``[B, Q, 2]``.
+            quality_logits: IoU quality logits, shape ``[B, Q]``.
+
+        Returns:
+            仅调整前景通道的 logits，形状为 ``[B, Q, 2]``。中心化使该分支只改变
+            query 间相对顺序，不改变单个样本的整体前景偏置。
+        """
+        correction = quality_logits - quality_logits.mean(dim=1, keepdim=True)
+        ranked = logits.clone()
+        ranked[..., 0] = ranked[..., 0] + self.qmt_iou_score_weight * correction
+        return ranked
+
     def forward(self, src_txt, src_txt_mask, src_vid, src_vid_mask):
         """Run QMT-DETR with the same input/output contract as Moment-DETR."""
         src_vid = self.input_vid_proj(src_vid)
@@ -175,7 +201,15 @@ class QMTDETR(MomentDETR):
             final_logits = self._calibrate_logits(
                 final_logits, outputs_coord[-1], saliency_scores, src_vid_mask,
             )
+        quality_logits = None
+        if self.qmt_iou_rank:
+            # 质量头只学习读取 decoder 表示，不反向改变已验证的 Cross 骨架。
+            quality_logits = self.qmt_iou_head(hs[-1].detach()).squeeze(-1)
+            if not self.training:
+                final_logits = self._apply_iou_ranking(final_logits, quality_logits)
         out = {"pred_logits": final_logits, "pred_spans": outputs_coord[-1]}
+        if quality_logits is not None:
+            out["qmt_iou_logits"] = quality_logits
         if self.contrastive_align_loss:
             proj_queries = F.normalize(self.contrastive_align_projection_query(hs), p=2, dim=-1)
             proj_txt_mem = F.normalize(self.contrastive_align_projection_txt(txt_mem), p=2, dim=-1)
@@ -208,7 +242,9 @@ class QMTSetCriterion(SetCriterion):
                  qmt_hard_negative_margin=0.2,
                  qmt_negative_query=False,
                  qmt_negative_query_margin=0.2,
-                 qmt_bridge=False, qmt_bridge_temperature=0.07, **kwargs):
+                 qmt_bridge=False, qmt_bridge_temperature=0.07,
+                 qmt_iou_rank=False, qmt_iou_rank_margin=0.1,
+                 qmt_iou_pair_coef=0.5, **kwargs):
         super().__init__(*args, **kwargs)
         self.qmt_hard_negative = qmt_hard_negative
         self.qmt_hard_negative_margin = qmt_hard_negative_margin
@@ -216,8 +252,15 @@ class QMTSetCriterion(SetCriterion):
         self.qmt_negative_query_margin = qmt_negative_query_margin
         self.qmt_bridge = qmt_bridge
         self.qmt_bridge_temperature = qmt_bridge_temperature
+        self.qmt_iou_rank = qmt_iou_rank
+        self.qmt_iou_rank_margin = qmt_iou_rank_margin
+        self.qmt_iou_pair_coef = qmt_iou_pair_coef
         if qmt_bridge_temperature <= 0:
             raise ValueError("Bridge temperature must be positive")
+        if qmt_iou_rank_margin < 0:
+            raise ValueError("IoU ranking margin must be non-negative")
+        if qmt_iou_pair_coef < 0:
+            raise ValueError("IoU pair coefficient must be non-negative")
 
     def loss_qmt_hard_negative(self, outputs, targets):
         """Contrast GT-interior saliency with the strongest exterior clip."""
@@ -316,6 +359,53 @@ class QMTSetCriterion(SetCriterion):
                 pair_losses.append(inside_loss + outside_loss)
         return torch.stack(pair_losses).mean() if pair_losses else queries.sum() * 0.0
 
+    def loss_qmt_iou_rank(self, outputs, targets):
+        """Regress proposal IoU and rank queries by detached boundary quality.
+
+        Args:
+            outputs: 最终层输出，含 ``[B, Q]`` 质量 logits 与 ``[B, Q, 2]`` span。
+            targets: 基线 ``prepare_batch_inputs`` 生成的训练目标。
+
+        Returns:
+            soft-IoU BCE 与有序 query 对 RankNet 损失之和。IoU target 由停止梯度的
+            预测边界计算，因此该项只训练质量头，不反向改变 Cross 定位骨架。
+        """
+        quality_logits = outputs["qmt_iou_logits"]
+        predicted_spans = outputs["pred_spans"].detach()
+        target_ious = []
+        for batch_index, span_target in enumerate(targets["span_labels"]):
+            predicted = predicted_spans[batch_index]
+            ground_truth = span_target["spans"].to(
+                device=predicted.device, dtype=predicted.dtype,
+            )
+            predicted_start = predicted[:, 0] - predicted[:, 1] / 2
+            predicted_end = predicted[:, 0] + predicted[:, 1] / 2
+            target_start = ground_truth[:, 0] - ground_truth[:, 1] / 2
+            target_end = ground_truth[:, 0] + ground_truth[:, 1] / 2
+            intersection = (
+                torch.minimum(predicted_end[:, None], target_end[None, :])
+                - torch.maximum(predicted_start[:, None], target_start[None, :])
+            ).clamp_min(0.0)
+            union = (
+                (predicted_end - predicted_start).clamp_min(0.0)[:, None]
+                + (target_end - target_start).clamp_min(0.0)[None, :]
+                - intersection
+            )
+            target_ious.append((intersection / union.clamp_min(1e-6)).max(dim=1).values)
+        target_ious = torch.stack(target_ious)
+        regression = F.binary_cross_entropy_with_logits(quality_logits, target_ious)
+
+        differences = target_ious[:, :, None] - target_ious[:, None, :]
+        ordered = differences > self.qmt_iou_rank_margin
+        if ordered.any():
+            logit_differences = quality_logits[:, :, None] - quality_logits[:, None, :]
+            pairwise = (
+                F.softplus(-logit_differences[ordered]) * differences[ordered]
+            ).sum() / differences[ordered].sum().clamp_min(1e-6)
+        else:
+            pairwise = quality_logits.sum() * 0.0
+        return regression + self.qmt_iou_pair_coef * pairwise
+
     def forward(self, outputs, targets):
         losses = super().forward(outputs, targets)
         if self.qmt_hard_negative:
@@ -327,6 +417,8 @@ class QMTSetCriterion(SetCriterion):
             }
             indices = self.matcher(outputs_without_aux, targets)
             losses["loss_qmt_bridge"] = self.loss_qmt_bridge(outputs, targets, indices)
+        if self.qmt_iou_rank:
+            losses["loss_qmt_iou_rank"] = self.loss_qmt_iou_rank(outputs, targets)
         return losses
 
 
@@ -352,6 +444,8 @@ def build_qmt_model(args):
         qmt_trcc_temperature=getattr(args, "qmt_trcc_temperature", 0.02),
         qmt_trcc_context_scale=getattr(args, "qmt_trcc_context_scale", 2.0),
         qmt_bridge=getattr(args, "qmt_bridge", False),
+        qmt_iou_rank=getattr(args, "qmt_iou_rank", False),
+        qmt_iou_score_weight=getattr(args, "qmt_iou_score_weight", 0.5),
     )
     weight_dict = {
         "loss_span": args.span_loss_coef, "loss_giou": args.giou_loss_coef,
@@ -365,12 +459,15 @@ def build_qmt_model(args):
         weight_dict["loss_qmt_negative_query"] = getattr(args, "qmt_negative_query_coef", 0.1)
     if getattr(args, "qmt_bridge", False):
         weight_dict["loss_qmt_bridge"] = getattr(args, "qmt_bridge_coef", 0.1)
+    if getattr(args, "qmt_iou_rank", False):
+        weight_dict["loss_qmt_iou_rank"] = getattr(args, "qmt_iou_rank_coef", 0.2)
     if args.aux_loss:
         for index in range(args.dec_layers - 1):
             weight_dict.update({
                 key + f"_{index}": value for key, value in list(weight_dict.items())
                 if key not in {"loss_saliency", "loss_qmt_hard_negative",
-                               "loss_qmt_negative_query", "loss_qmt_bridge"}
+                               "loss_qmt_negative_query", "loss_qmt_bridge",
+                               "loss_qmt_iou_rank"}
                 and not key.rsplit("_", 1)[-1].isdigit()
             })
     losses = ["spans", "labels", "saliency"]
@@ -387,6 +484,9 @@ def build_qmt_model(args):
         qmt_negative_query_margin=getattr(args, "qmt_negative_query_margin", 0.2),
         qmt_bridge=getattr(args, "qmt_bridge", False),
         qmt_bridge_temperature=getattr(args, "qmt_bridge_temperature", 0.07),
+        qmt_iou_rank=getattr(args, "qmt_iou_rank", False),
+        qmt_iou_rank_margin=getattr(args, "qmt_iou_rank_margin", 0.1),
+        qmt_iou_pair_coef=getattr(args, "qmt_iou_pair_coef", 0.5),
     )
     criterion.to(device)
     return model, criterion
