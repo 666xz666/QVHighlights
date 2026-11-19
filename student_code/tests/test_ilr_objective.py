@@ -1,6 +1,6 @@
 import torch
 
-from student_code.ilr_objective import (combined_ilr_loss, first_answer_score,
+from student_code.ilr.objective import (combined_ilr_loss, first_answer_score,
                                         ilr_auxiliary_loss)
 
 

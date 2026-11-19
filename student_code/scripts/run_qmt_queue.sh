@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Usage: bash student_code/run_qmt_queue.sh <cuda-ordinal> <full|cross|cross-multiscale|off-multiscale|cross-neg-query> <seed> [seed ...]
+# Usage: bash student_code/scripts/run_qmt_queue.sh <cuda-ordinal> <full|cross|cross-multiscale|off-multiscale|cross-neg-query> <seed> [seed ...]
 set -euo pipefail
 
 CUDA_ORDINAL=${1:?CUDA ordinal required}
@@ -35,7 +35,7 @@ for SEED in "$@"; do
   fi
   echo "[$(date '+%F %T')] start ${VARIANT} seed${SEED} CUDA ordinal ${CUDA_ORDINAL} (${DEVICE_INFO})" | tee -a "$LOG"
   CUDA_DEVICE_ORDER=FASTEST_FIRST CUDA_VISIBLE_DEVICES="$CUDA_ORDINAL" \
-    "$PY" student_code/train_qmt_locator.py \
+    "$PY" student_code/qmt/train.py \
       --feature-root data/features \
       --train-annotations data/course/train.jsonl \
       --dev-annotations data/course/dev.jsonl \

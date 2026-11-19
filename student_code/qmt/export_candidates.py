@@ -8,13 +8,13 @@ from pathlib import Path
 import sys
 from types import SimpleNamespace
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 sys.path[:0] = [str(ROOT / "scripts"), str(ROOT / "upstream" / "moment_detr"), str(ROOT)]
 
 from evaluate import validate_predictions
 from locator_common import audit_features, discover_features, dump_json, make_dataset, predict
 from prepare_course_data import read_jsonl, source_id, write_jsonl
-from student_code.qmt_model import build_qmt_model
+from student_code.qmt.model import build_qmt_model
 
 
 def main():

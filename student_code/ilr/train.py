@@ -9,10 +9,10 @@ import random
 import sys
 import time
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from student_code.ilr_objective import combined_ilr_loss, first_answer_score
+from student_code.ilr.objective import combined_ilr_loss, first_answer_score
 from vlm.common import file_sha256, load_jsonl
 from vlm.modeling import load_model, prepare_inputs, read_config, to_cuda
 from vlm.train import snapshot_trainable, update_evidence

@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from student_code.train_ilr import validate_pairs
+from student_code.ilr.train import validate_pairs
 from vlm.common import load_jsonl
 
 

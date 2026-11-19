@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Usage: bash student_code/run_ilr_queue.sh <cuda-ordinal> <full|off> <seed> [seed ...]
+# Usage: bash student_code/scripts/run_ilr_queue.sh <cuda-ordinal> <full|off> <seed> [seed ...]
 set -euo pipefail
 
 CUDA_ORDINAL=${1:?CUDA ordinal required}
@@ -37,7 +37,7 @@ for SEED in "$@"; do
       fi
     done
     CUDA_DEVICE_ORDER=FASTEST_FIRST CUDA_VISIBLE_DEVICES="$CUDA_ORDINAL" \
-      "$PY" student_code/train_ilr.py \
+      "$PY" student_code/ilr/train.py \
         --config "$CONFIG" --train-data data/reference_full/sft_pairwise.jsonl \
         --cache-only --cache-dir data/reference_frame_cache \
         --output-dir "$RUN" --seed "$SEED" "${FLAGS[@]}" "${RESUME[@]}" >> "$LOG" 2>&1

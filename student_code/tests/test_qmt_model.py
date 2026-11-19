@@ -3,8 +3,8 @@ from types import SimpleNamespace
 import torch
 
 from locator_common import model_config
-from student_code.qmt_model import build_qmt_model
-from student_code import train_qmt_locator
+from student_code.qmt.model import build_qmt_model
+from student_code.qmt import train as train_qmt_locator
 
 
 def qmt_config(**overrides):
