@@ -11,6 +11,8 @@ QMT-DETR 在 Moment-DETR 投影层之后、视频文本拼接之前加入：
 3. 空洞率为 1、2、4 的深度可分离时序卷积，由文本表示预测尺度权重；
 4. 仅作用于最终层的 GT 内部—困难背景 saliency margin loss。
 
+后续受控变体 `cross-neg-query` 保留第 1、2 项并移除多尺度与同视频困难背景损失。训练时将文本沿 batch 维循环移位，构造视频—查询错配，并约束正确配对的标注显著 clip 均值至少比错配查询下所有有效 clip 的最高分高 0.2。该项权重为 0.1；batch size 为 1 时自动跳过。推理路径与候选导出接口不变。
+
 模型配置随 checkpoint 保存，`export_qmt_candidates.py` 只接受 QMT checkpoint，并以 `strict=True` 重载参数。正式 A 实验沿用 40 epoch、batch 32、学习率 `1e-4`、每 5 epoch 评估以及种子 42/2026/3407。
 
 ILR-QLoRA 读取固定的 `data/reference_full/sft_pairwise.jsonl`。每个固定二候选对分别进行 pointwise 前向，使用第一个监督答案 token 之前的
@@ -60,9 +62,10 @@ tail -f /data14T/xz/repos/QVHighlights/outputs/logs/QMT/full_queue.out
 bash student_code/run_qmt_queue.sh <cuda-ordinal> cross 42 2026 3407
 bash student_code/run_qmt_queue.sh <cuda-ordinal> cross-multiscale 42 2026 3407
 bash student_code/run_qmt_queue.sh <cuda-ordinal> off-multiscale 42 2026 3407
+bash student_code/run_qmt_queue.sh <cuda-ordinal> cross-neg-query 42 2026 3407
 ```
 
-其中 `cross` 仅启用交叉注意力，`cross-multiscale` 再加入多尺度分支，`off-multiscale` 从完整方法中移除多尺度分支但保留困难负样本损失。
+其中 `cross` 仅启用交叉注意力，`cross-multiscale` 再加入多尺度分支，`off-multiscale` 从完整方法中移除多尺度分支但保留困难负样本损失，`cross-neg-query` 在仅 Cross 骨架上加入 Negative-query Saliency Calibration。新校准项默认系数为 `0.1`、margin 为 `0.2`；batch size 小于 2 时自动跳过。
 
 选定配置后导出候选：
 

@@ -130,13 +130,17 @@ class QMTDETR(MomentDETR):
 
 
 class QMTSetCriterion(SetCriterion):
-    """Baseline criterion plus an optional top-layer hard-negative margin."""
+    """Baseline criterion plus optional top-layer saliency calibration losses."""
 
     def __init__(self, *args, qmt_hard_negative=False,
-                 qmt_hard_negative_margin=0.2, **kwargs):
+                 qmt_hard_negative_margin=0.2,
+                 qmt_negative_query=False,
+                 qmt_negative_query_margin=0.2, **kwargs):
         super().__init__(*args, **kwargs)
         self.qmt_hard_negative = qmt_hard_negative
         self.qmt_hard_negative_margin = qmt_hard_negative_margin
+        self.qmt_negative_query = qmt_negative_query
+        self.qmt_negative_query_margin = qmt_negative_query_margin
 
     def loss_qmt_hard_negative(self, outputs, targets):
         """Contrast GT-interior saliency with the strongest exterior clip."""
@@ -159,6 +163,39 @@ class QMTSetCriterion(SetCriterion):
                 + valid_scores[~inside].max()
             ))
         return torch.stack(losses).mean() if losses else scores.sum() * 0.0
+
+    def loss_qmt_negative_query(self, outputs, negative_outputs, targets):
+        """Separate matched salient clips from every valid mismatched-query clip.
+
+        Args:
+            outputs: 正确视频—查询配对的模型输出。
+            negative_outputs: 视频不变、文本在 batch 维循环移位后的模型输出。
+            targets: 基线 ``prepare_batch_inputs`` 生成的训练目标。
+
+        Returns:
+            标量 margin loss。batch size 小于 2 时由训练循环跳过该项。
+        """
+        positive_scores = outputs["saliency_scores"]
+        negative_scores = negative_outputs["saliency_scores"]
+        video_mask = outputs["video_mask"].bool()
+        if "saliency_pos_labels" not in targets:
+            return positive_scores.sum() * 0.0
+        positive_indices = targets["saliency_pos_labels"].long()
+        batch_indices = torch.arange(
+            positive_scores.shape[0], device=positive_scores.device,
+        )[:, None]
+        positive_anchor = positive_scores[batch_indices, positive_indices].mean(1)
+        strongest_mismatch = negative_scores.masked_fill(
+            ~video_mask, torch.finfo(negative_scores.dtype).min,
+        ).max(1).values
+        valid_rows = video_mask.any(1)
+        if not valid_rows.any():
+            return positive_scores.sum() * 0.0
+        return F.relu(
+            self.qmt_negative_query_margin
+            - positive_anchor[valid_rows]
+            + strongest_mismatch[valid_rows]
+        ).mean()
 
     def forward(self, outputs, targets):
         losses = super().forward(outputs, targets)
@@ -194,11 +231,14 @@ def build_qmt_model(args):
         weight_dict["loss_contrastive_align"] = args.contrastive_align_loss_coef
     if getattr(args, "qmt_hard_negative", False):
         weight_dict["loss_qmt_hard_negative"] = getattr(args, "qmt_hard_negative_coef", 0.1)
+    if getattr(args, "qmt_negative_query", False):
+        weight_dict["loss_qmt_negative_query"] = getattr(args, "qmt_negative_query_coef", 0.1)
     if args.aux_loss:
         for index in range(args.dec_layers - 1):
             weight_dict.update({
                 key + f"_{index}": value for key, value in list(weight_dict.items())
-                if key not in {"loss_saliency", "loss_qmt_hard_negative"}
+                if key not in {"loss_saliency", "loss_qmt_hard_negative",
+                               "loss_qmt_negative_query"}
                 and not key.rsplit("_", 1)[-1].isdigit()
             })
     losses = ["spans", "labels", "saliency"]
@@ -211,6 +251,8 @@ def build_qmt_model(args):
         saliency_margin=args.saliency_margin,
         qmt_hard_negative=getattr(args, "qmt_hard_negative", False),
         qmt_hard_negative_margin=getattr(args, "qmt_hard_negative_margin", 0.2),
+        qmt_negative_query=getattr(args, "qmt_negative_query", False),
+        qmt_negative_query_margin=getattr(args, "qmt_negative_query_margin", 0.2),
     )
     criterion.to(device)
     return model, criterion

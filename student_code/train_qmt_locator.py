@@ -21,6 +21,20 @@ from prepare_course_data import assert_disjoint, read_jsonl, source_id, write_js
 from student_code.qmt_model import build_qmt_model
 
 
+def make_cyclic_mismatch(model_inputs):
+    """Return a batch with each video paired to the preceding query.
+
+    ``None`` is returned for a singleton batch because it has no in-batch negative.
+    Video tensors and all non-text inputs retain their original objects.
+    """
+    if model_inputs["src_txt"].shape[0] < 2:
+        return None
+    mismatched = dict(model_inputs)
+    mismatched["src_txt"] = model_inputs["src_txt"].roll(1, dims=0)
+    mismatched["src_txt_mask"] = model_inputs["src_txt_mask"].roll(1, dims=0)
+    return mismatched
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--feature-root", required=True)
@@ -43,6 +57,9 @@ def parse_args():
     parser.add_argument("--qmt-gate-bias", type=float, default=-2.0)
     parser.add_argument("--qmt-hard-negative-coef", type=float, default=0.1)
     parser.add_argument("--qmt-hard-negative-margin", type=float, default=0.2)
+    parser.add_argument("--qmt-negative-query", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--qmt-negative-query-coef", type=float, default=0.1)
+    parser.add_argument("--qmt-negative-query-margin", type=float, default=0.2)
     return parser.parse_args()
 
 
@@ -58,6 +75,9 @@ def qmt_model_config(args):
         qmt_gate_bias=args.qmt_gate_bias,
         qmt_hard_negative_coef=args.qmt_hard_negative_coef,
         qmt_hard_negative_margin=args.qmt_hard_negative_margin,
+        qmt_negative_query=args.qmt_negative_query,
+        qmt_negative_query_coef=args.qmt_negative_query_coef,
+        qmt_negative_query_margin=args.qmt_negative_query_margin,
     )
     return config
 
@@ -133,11 +153,21 @@ def main():
     for epoch in range(1, args.epochs + 1):
         model.train()
         epoch_losses = []
+        epoch_negative_query_losses = []
         start = time.time()
         for batch in train_loader:
             model_inputs, targets = prepare_batch_inputs(batch[1], device, non_blocking=True)
             outputs = model(**model_inputs)
             loss_dict = criterion(outputs, targets)
+            mismatched_inputs = make_cyclic_mismatch(model_inputs) if args.qmt_negative_query else None
+            if mismatched_inputs is not None:
+                negative_outputs = model(**mismatched_inputs)
+                loss_dict["loss_qmt_negative_query"] = criterion.loss_qmt_negative_query(
+                    outputs, negative_outputs, targets,
+                )
+                epoch_negative_query_losses.append(
+                    float(loss_dict["loss_qmt_negative_query"].detach()),
+                )
             loss = sum(loss_dict[key] * criterion.weight_dict[key]
                        for key in loss_dict if key in criterion.weight_dict)
             if not torch.isfinite(loss):
@@ -149,6 +179,10 @@ def main():
             epoch_losses.append(float(loss.detach()))
         record = {"epoch": epoch, "train_loss": sum(epoch_losses) / len(epoch_losses),
                   "seconds": time.time() - start}
+        if epoch_negative_query_losses:
+            record["train_loss_qmt_negative_query"] = (
+                sum(epoch_negative_query_losses) / len(epoch_negative_query_losses)
+            )
         if epoch % args.eval_every == 0 or epoch == args.epochs:
             prediction_path = output_dir / f"dev_predictions_epoch_{epoch}.jsonl"
             predictions = predict(model, dev_loader, device, "dev")

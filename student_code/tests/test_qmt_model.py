@@ -13,6 +13,8 @@ def qmt_config(**overrides):
         qmt_cross_attn=True, qmt_multiscale=True, qmt_hard_negative=True,
         qmt_num_heads=8, qmt_dilations=(1, 2, 4), qmt_gate_bias=-2.0,
         qmt_hard_negative_coef=0.1, qmt_hard_negative_margin=0.2,
+        qmt_negative_query=False, qmt_negative_query_coef=0.1,
+        qmt_negative_query_margin=0.2,
     )
     config.update(overrides)
     return SimpleNamespace(**config)
@@ -68,6 +70,48 @@ def test_hard_negative_margin_uses_gt_interior_and_exterior():
     targets = {"span_labels": [{"spans": torch.tensor([[0.375, 0.25]])}]}
     loss = criterion.loss_qmt_hard_negative(outputs, targets)
     assert loss.item() > 0
+
+
+def test_negative_query_margin_uses_all_valid_mismatched_clips():
+    _, criterion = build_qmt_model(qmt_config(qmt_negative_query=True))
+    positive_scores = torch.tensor(
+        [[0.0, 2.0, 4.0, 0.0]], requires_grad=True,
+    )
+    outputs = {
+        "saliency_scores": positive_scores,
+        "video_mask": torch.tensor([[1, 1, 1, 0]], dtype=torch.bool),
+    }
+    targets = {"saliency_pos_labels": torch.tensor([[1, 2]])}
+    easy_mismatch = {"saliency_scores": torch.tensor([[0.0, 0.0, 0.0, 99.0]])}
+    negative_scores = torch.tensor(
+        [[0.0, 3.5, 0.0, 99.0]], requires_grad=True,
+    )
+    hard_mismatch = {"saliency_scores": negative_scores}
+    easy_loss = criterion.loss_qmt_negative_query(outputs, easy_mismatch, targets)
+    hard_loss = criterion.loss_qmt_negative_query(outputs, hard_mismatch, targets)
+    assert easy_loss.item() == 0.0
+    assert hard_loss.item() > 0.0
+    hard_loss.backward()
+    assert positive_scores.grad[0, 1].item() < 0.0
+    assert positive_scores.grad[0, 2].item() < 0.0
+    assert negative_scores.grad[0, 1].item() > 0.0
+    assert negative_scores.grad[0, 3].item() == 0.0
+
+
+def test_cyclic_mismatch_rotates_text_only_and_skips_singletons():
+    model_inputs = {
+        "src_vid": torch.tensor([[10.0], [20.0], [30.0]]),
+        "src_vid_mask": torch.ones(3, 1),
+        "src_txt": torch.tensor([[1.0], [2.0], [3.0]]),
+        "src_txt_mask": torch.tensor([[1], [1], [0]]),
+    }
+    mismatched = train_qmt_locator.make_cyclic_mismatch(model_inputs)
+    assert mismatched is not None
+    assert mismatched["src_vid"] is model_inputs["src_vid"]
+    torch.testing.assert_close(mismatched["src_txt"], torch.tensor([[3.0], [1.0], [2.0]]))
+    torch.testing.assert_close(mismatched["src_txt_mask"], torch.tensor([[0], [1], [1]]))
+    singleton = {key: value[:1] for key, value in model_inputs.items()}
+    assert train_qmt_locator.make_cyclic_mismatch(singleton) is None
 
 
 def test_qmt_dev_evaluation_uses_row_contract_and_brief_map():
