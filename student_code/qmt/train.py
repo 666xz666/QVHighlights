@@ -21,6 +21,14 @@ from prepare_course_data import assert_disjoint, read_jsonl, source_id, write_js
 from student_code.qmt.model import build_qmt_model
 
 
+def build_lr_scheduler(optimizer, epochs):
+    """Build the same 75%-budget StepLR schedule as the course A0 trainer."""
+    import torch
+
+    step_size = max(1, int(epochs * 0.75))
+    return torch.optim.lr_scheduler.StepLR(optimizer, step_size=step_size, gamma=0.1)
+
+
 def make_cyclic_mismatch(model_inputs):
     """Return a batch with each video paired to the preceding query.
 
@@ -125,6 +133,8 @@ def main():
     from torch.utils.data import DataLoader
     from moment_detr.start_end_dataset import start_end_collate, prepare_batch_inputs
 
+    if min(args.epochs, args.batch_size, args.workers + 1, args.eval_every) < 1:
+        raise ValueError("epochs/batch-size/workers/eval-every must be valid")
     if (args.qmt_multiscale or args.qmt_trcc or args.qmt_bridge or args.qmt_iou_rank) and not args.qmt_cross_attn:
         raise ValueError("QMT refinements require --qmt-cross-attn")
     if args.qmt_bridge_temperature <= 0:
@@ -162,6 +172,7 @@ def main():
     model.to(device)
     trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
     optimizer = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = build_lr_scheduler(optimizer, args.epochs)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     train_qids = sorted(row["qid"] for row in train_rows)
@@ -180,6 +191,7 @@ def main():
 
     for epoch in range(1, args.epochs + 1):
         model.train()
+        epoch_learning_rate = optimizer.param_groups[0]["lr"]
         epoch_losses = []
         epoch_negative_query_losses = []
         start = time.time()
@@ -205,7 +217,9 @@ def main():
             torch.nn.utils.clip_grad_norm_(trainable, 0.1)
             optimizer.step()
             epoch_losses.append(float(loss.detach()))
+        scheduler.step()
         record = {"epoch": epoch, "train_loss": sum(epoch_losses) / len(epoch_losses),
+                  "learning_rate": epoch_learning_rate,
                   "seconds": time.time() - start}
         if epoch_negative_query_losses:
             record["train_loss_qmt_negative_query"] = (
@@ -229,6 +243,13 @@ def main():
         "train_queries": len(train_rows), "dev_queries": len(dev_rows),
         "train_annotation_sha256": hashlib.sha256(Path(args.train_annotations).read_bytes()).hexdigest(),
         "dev_annotation_sha256": hashlib.sha256(Path(args.dev_annotations).read_bytes()).hexdigest(),
+        "training_config": {
+            "epochs": args.epochs, "batch_size": args.batch_size,
+            "learning_rate": args.lr, "weight_decay": args.weight_decay,
+            "eval_every": args.eval_every,
+            "lr_scheduler": "StepLR", "lr_drop_epoch": max(1, int(args.epochs * 0.75)),
+            "lr_gamma": 0.1,
+        },
         "model_config": config,
     })
 

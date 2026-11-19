@@ -11,6 +11,7 @@ def main():
         ilr.test_combined_loss_reports_all_components,
         ilr.test_zero_auxiliary_weights_is_pair_grouped_ce_ablation,
         ilr_data.test_fixed_pair_pool_matches_ilr_contract,
+        qmt.test_qmt_lr_schedule_matches_course_baseline_budget,
         qmt.test_qmt_configuration_is_checkpoint_reloadable,
         qmt.test_qmt_parameters_receive_updates,
         qmt.test_hard_negative_margin_uses_gt_interior_and_exterior,

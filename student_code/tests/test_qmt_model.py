@@ -24,6 +24,21 @@ def qmt_config(**overrides):
     return SimpleNamespace(**config)
 
 
+def test_qmt_lr_schedule_matches_course_baseline_budget():
+    parameter = torch.nn.Parameter(torch.tensor(0.0))
+    optimizer = torch.optim.AdamW([parameter], lr=1e-4)
+    scheduler = train_qmt_locator.build_lr_scheduler(optimizer, epochs=60)
+
+    assert scheduler.step_size == 45
+    for _ in range(44):
+        optimizer.step()
+        scheduler.step()
+    assert optimizer.param_groups[0]["lr"] == 1e-4
+    optimizer.step()
+    scheduler.step()
+    assert abs(optimizer.param_groups[0]["lr"] - 1e-5) < 1e-12
+
+
 def test_qmt_configuration_is_checkpoint_reloadable():
     torch.manual_seed(7)
     model, _ = build_qmt_model(qmt_config())

@@ -1,11 +1,18 @@
 #!/usr/bin/env bash
-# Usage: bash student_code/scripts/run_qmt_queue.sh <cuda-ordinal> <full|cross|cross-multiscale|off-multiscale|cross-neg-query|cross-trcc|cross-bridge|cross-iou-rank> <seed> [seed ...]
+# Usage: bash student_code/scripts/run_qmt_queue.sh <cuda-ordinal> <variant> [--epochs N] <seed> [seed ...]
 set -euo pipefail
 
 CUDA_ORDINAL=${1:?CUDA ordinal required}
 VARIANT=${2:?variant required}
 shift 2
 [[ "$CUDA_ORDINAL" =~ ^[0-9]+$ ]] || { echo "CUDA ordinal must be numeric" >&2; exit 2; }
+EPOCHS=40
+if [[ "${1:-}" == "--epochs" ]]; then
+  EPOCHS=${2:?epoch count required after --epochs}
+  shift 2
+fi
+[[ "$EPOCHS" =~ ^[1-9][0-9]*$ ]] || { echo "Epoch count must be a positive integer" >&2; exit 2; }
+(( $# > 0 )) || { echo "At least one seed is required" >&2; exit 2; }
 case "$VARIANT" in
   full) FLAGS=() ;;
   cross) FLAGS=(--no-qmt-multiscale --no-qmt-hard-negative) ;;
@@ -25,13 +32,19 @@ DEVICE_INFO=$(CUDA_DEVICE_ORDER=FASTEST_FIRST CUDA_VISIBLE_DEVICES="$CUDA_ORDINA
   echo "CUDA ordinal ${CUDA_ORDINAL} cannot be initialized with FASTEST_FIRST" >&2
   exit 3
 }
-mkdir -p "outputs/QMT/${VARIANT}" outputs/logs/QMT
-LOCK="outputs/QMT/${VARIANT}/.queue.lock"
+OUTPUT_ROOT=outputs/QMT
+LOG_ROOT=outputs/logs/QMT
+if (( EPOCHS != 40 )); then
+  OUTPUT_ROOT="outputs/QMT_epoch${EPOCHS}"
+  LOG_ROOT="outputs/logs/QMT_epoch${EPOCHS}"
+fi
+mkdir -p "${OUTPUT_ROOT}/${VARIANT}" "$LOG_ROOT"
+LOCK="${OUTPUT_ROOT}/${VARIANT}/.queue.lock"
 exec 9>"$LOCK"
 flock -n 9 || { echo "Another QMT ${VARIANT} queue is already running" >&2; exit 4; }
 for SEED in "$@"; do
-  RUN="outputs/QMT/${VARIANT}/seed${SEED}"
-  LOG="outputs/logs/QMT/${VARIANT}_seed${SEED}.log"
+  RUN="${OUTPUT_ROOT}/${VARIANT}/seed${SEED}"
+  LOG="${LOG_ROOT}/${VARIANT}_seed${SEED}.log"
   if [[ -f "$RUN/model_best.pt" && -f "$RUN/summary.json" ]]; then
     echo "[$(date '+%F %T')] skip completed ${VARIANT} seed${SEED}" | tee -a "$LOG"
     continue
@@ -42,5 +55,6 @@ for SEED in "$@"; do
       --feature-root data/features \
       --train-annotations data/course/train.jsonl \
       --dev-annotations data/course/dev.jsonl \
-      --output-dir "$RUN" --seed "$SEED" "${FLAGS[@]}" >> "$LOG" 2>&1
+      --output-dir "$RUN" --seed "$SEED" --epochs "$EPOCHS" \
+      "${FLAGS[@]}" >> "$LOG" 2>&1
 done
