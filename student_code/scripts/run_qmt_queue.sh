@@ -16,6 +16,8 @@ fi
 case "$VARIANT" in
   full) FLAGS=() ;;
   cross) FLAGS=(--no-qmt-multiscale --no-qmt-hard-negative) ;;
+  gate-only) FLAGS=(--no-qmt-cross-attn --no-qmt-multiscale --no-qmt-hard-negative --qmt-feature-gate) ;;
+  cross-gate) FLAGS=(--no-qmt-multiscale --no-qmt-hard-negative --qmt-feature-gate) ;;
   cross-multiscale) FLAGS=(--no-qmt-hard-negative) ;;
   off-multiscale) FLAGS=(--no-qmt-multiscale) ;;
   cross-neg-query) FLAGS=(--no-qmt-multiscale --no-qmt-hard-negative --qmt-negative-query) ;;
@@ -25,8 +27,8 @@ case "$VARIANT" in
   *) echo "Unknown variant: $VARIANT" >&2; exit 2 ;;
 esac
 
-cd /data14T/xz/repos/QVHighlights
-PY=/data14T/xz/miniconda3/envs/QVHighlights/bin/python
+cd "$(dirname "${BASH_SOURCE[0]}")/../.."
+PY=${QVH_PYTHON:-$(conda run -n QVHighlights python -c 'import sys; print(sys.executable)' | tail -n 1)}
 DEVICE_INFO=$(CUDA_DEVICE_ORDER=FASTEST_FIRST CUDA_VISIBLE_DEVICES="$CUDA_ORDINAL" \
   "$PY" -c 'import torch; assert torch.cuda.is_available(); print(torch.cuda.get_device_name(0))') || {
   echo "CUDA ordinal ${CUDA_ORDINAL} cannot be initialized with FASTEST_FIRST" >&2

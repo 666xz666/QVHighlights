@@ -19,11 +19,12 @@ class QMTDETR(MomentDETR):
                  qmt_gate_bias=-2.0, qmt_trcc=False,
                  qmt_trcc_temperature=0.02, qmt_trcc_context_scale=2.0,
                  qmt_bridge=False, qmt_iou_rank=False,
-                 qmt_iou_score_weight=0.5,
+                 qmt_iou_score_weight=0.5, qmt_feature_gate=False,
                  **kwargs):
         super().__init__(*args, **kwargs)
         hidden_dim = self.transformer.d_model
         self.qmt_cross_attn = qmt_cross_attn
+        self.qmt_feature_gate = qmt_feature_gate
         self.qmt_multiscale = qmt_multiscale
         self.qmt_trcc = qmt_trcc
         self.qmt_bridge = qmt_bridge
@@ -68,6 +69,44 @@ class QMTDETR(MomentDETR):
             # 零初始化保证首次评估时所有 query 的排序与仅 Cross 完全一致。
             nn.init.zeros_(self.qmt_iou_head[-1].weight)
             nn.init.zeros_(self.qmt_iou_head[-1].bias)
+
+        if qmt_feature_gate:
+            if kwargs["vid_dim"] != 2818 or kwargs["txt_dim"] != 512:
+                raise ValueError("Feature gate requires SlowFast2304 + CLIP512 + time2 and text512")
+            # 隔离初始化随机数，使配对对照的后续 dropout 随机流保持一致。
+            with torch.random.fork_rng(devices=[]):
+                self.qmt_feature_gate_mlp = nn.Sequential(
+                    nn.Linear(512, 128), nn.ReLU(), nn.Linear(128, 2),
+                )
+            nn.init.zeros_(self.qmt_feature_gate_mlp[-1].weight)
+            nn.init.zeros_(self.qmt_feature_gate_mlp[-1].bias)
+
+    def feature_gates(self, src_txt, src_txt_mask):
+        """从有效原始文本特征计算两个模态缩放门，零初始化时恒为1。
+
+        Args:
+            src_txt (Float[Tensor, "B T 512"]): 原始文本特征。
+            src_txt_mask (Bool[Tensor, "B T"]): True代表有效token。
+
+        Returns:
+            Float[Tensor, "B 2"]: SlowFast和CLIP门值，范围为(0, 2)。
+        """
+        pooled = self._masked_text_mean(src_txt, src_txt_mask)
+        return 1 + torch.tanh(self.qmt_feature_gate_mlp(pooled))
+
+    def _gate_features(self, src_vid, gates):
+        """在投影前调制两路视觉特征，保持时间通道和输入张量不变。
+
+        Args:
+            src_vid (Float[Tensor, "B V 2818"]): SF、CLIP、时间顺序的特征。
+            gates (Float[Tensor, "B 2"]): 查询条件缩放门。
+
+        Returns:
+            Float[Tensor, "B V 2818"]: 保持维度的调制特征。
+        """
+        return torch.cat((src_vid[..., :2304] * gates[:, None, 0:1],
+                          src_vid[..., 2304:2816] * gates[:, None, 1:2],
+                          src_vid[..., 2816:]), dim=-1)
 
     @staticmethod
     def _masked_text_mean(src_txt, src_txt_mask):
@@ -178,6 +217,9 @@ class QMTDETR(MomentDETR):
 
     def forward(self, src_txt, src_txt_mask, src_vid, src_vid_mask):
         """Run QMT-DETR with the same input/output contract as Moment-DETR."""
+        gates = self.feature_gates(src_txt, src_txt_mask) if self.qmt_feature_gate else None
+        if gates is not None:
+            src_vid = self._gate_features(src_vid, gates)
         src_vid = self.input_vid_proj(src_vid)
         src_txt = self.input_txt_proj(src_txt)
         if self.qmt_cross_attn:
@@ -208,6 +250,8 @@ class QMTDETR(MomentDETR):
             if not self.training:
                 final_logits = self._apply_iou_ranking(final_logits, quality_logits)
         out = {"pred_logits": final_logits, "pred_spans": outputs_coord[-1]}
+        if gates is not None:
+            out["feature_gates"] = gates
         if quality_logits is not None:
             out["qmt_iou_logits"] = quality_logits
         if self.contrastive_align_loss:
@@ -436,6 +480,7 @@ def build_qmt_model(args):
         span_loss_type=args.span_loss_type, use_txt_pos=args.use_txt_pos,
         n_input_proj=args.n_input_proj,
         qmt_cross_attn=getattr(args, "qmt_cross_attn", False),
+        qmt_feature_gate=getattr(args, "qmt_feature_gate", False),
         qmt_multiscale=getattr(args, "qmt_multiscale", False),
         qmt_num_heads=getattr(args, "qmt_num_heads", 8),
         qmt_dilations=getattr(args, "qmt_dilations", (1, 2, 4)),

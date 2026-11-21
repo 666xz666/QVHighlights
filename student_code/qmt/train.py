@@ -58,6 +58,7 @@ def parse_args():
     parser.add_argument("--eval-every", type=int, default=5)
     parser.add_argument("--device", default="cuda", choices=["cuda", "cpu"])
     parser.add_argument("--qmt-cross-attn", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--qmt-feature-gate", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--qmt-multiscale", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--qmt-hard-negative", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--qmt-num-heads", type=int, default=8)
@@ -87,6 +88,7 @@ def qmt_model_config(args):
     config = model_config(args.device)
     config.update(
         qmt_cross_attn=args.qmt_cross_attn,
+        qmt_feature_gate=args.qmt_feature_gate,
         qmt_multiscale=args.qmt_multiscale,
         qmt_hard_negative=args.qmt_hard_negative,
         qmt_num_heads=args.qmt_num_heads,
@@ -193,11 +195,14 @@ def main():
         model.train()
         epoch_learning_rate = optimizer.param_groups[0]["lr"]
         epoch_losses = []
+        epoch_gates = []
         epoch_negative_query_losses = []
         start = time.time()
         for batch in train_loader:
             model_inputs, targets = prepare_batch_inputs(batch[1], device, non_blocking=True)
             outputs = model(**model_inputs)
+            if args.qmt_feature_gate:
+                epoch_gates.append(outputs["feature_gates"].detach().cpu())
             loss_dict = criterion(outputs, targets)
             mismatched_inputs = make_cyclic_mismatch(model_inputs) if args.qmt_negative_query else None
             if mismatched_inputs is not None:
@@ -225,6 +230,13 @@ def main():
             record["train_loss_qmt_negative_query"] = (
                 sum(epoch_negative_query_losses) / len(epoch_negative_query_losses)
             )
+        if epoch_gates:
+            gates = torch.cat(epoch_gates)
+            record["feature_gate"] = {
+                "mean": gates.mean(0).tolist(), "std": gates.std(0, unbiased=False).tolist(),
+                "min": gates.amin(0).tolist(), "max": gates.amax(0).tolist(),
+                "output_weight_norm": float(model.qmt_feature_gate_mlp[-1].weight.detach().norm()),
+            }
         if epoch % args.eval_every == 0 or epoch == args.epochs:
             prediction_path = output_dir / f"dev_predictions_epoch_{epoch}.jsonl"
             predictions = predict(model, dev_loader, device, "dev")

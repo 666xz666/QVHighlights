@@ -13,8 +13,8 @@ fi
 [[ "$EPOCHS" =~ ^[1-9][0-9]*$ ]] || { echo "Epoch count must be a positive integer" >&2; exit 2; }
 (( $# > 0 )) || { echo "At least one seed is required" >&2; exit 2; }
 
-cd /data14T/xz/repos/QVHighlights
-PY=/data14T/xz/miniconda3/envs/QVHighlights/bin/python
+cd "$(dirname "${BASH_SOURCE[0]}")/../.."
+PY=${QVH_PYTHON:-$(conda run -n QVHighlights python -c 'import sys; print(sys.executable)' | tail -n 1)}
 DEVICE_INFO=$(CUDA_DEVICE_ORDER=FASTEST_FIRST CUDA_VISIBLE_DEVICES="$CUDA_ORDINAL" \
   "$PY" -c 'import torch; assert torch.cuda.is_available(); print(torch.cuda.get_device_name(0))') || {
   echo "CUDA ordinal ${CUDA_ORDINAL} cannot be initialized with FASTEST_FIRST" >&2

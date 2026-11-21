@@ -12,8 +12,8 @@ case "$VARIANT" in
   *) echo "Unknown variant: $VARIANT" >&2; exit 2 ;;
 esac
 
-cd /data14T/xz/repos/QVHighlights
-PY=/data14T/xz/miniconda3/envs/QVHighlights/bin/python
+cd "$(dirname "${BASH_SOURCE[0]}")/../.."
+PY=${QVH_PYTHON:-$(conda run -n QVHighlights python -c 'import sys; print(sys.executable)' | tail -n 1)}
 CONFIG=student_code/configs/vlm_qlora_ilr.json
 DEVICE_INFO=$(CUDA_DEVICE_ORDER=FASTEST_FIRST CUDA_VISIBLE_DEVICES="$CUDA_ORDINAL" \
   "$PY" -c 'import torch; assert torch.cuda.is_available(); print(torch.cuda.get_device_name(0))') || {
