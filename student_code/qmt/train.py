@@ -61,6 +61,8 @@ def parse_args():
     parser.add_argument("--qmt-cross-attn", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--qmt-feature-gate", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--qmt-tcn", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument('--save-last', action='store_true', help='Save resumable epoch checkpoints')
+    parser.add_argument('--resume', type=Path, help='Restore a trusted model_last.pt checkpoint')
     parser.add_argument("--qmt-dense-foreground", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--qmt-foreground-coef", type=float, default=0.1)
     parser.add_argument("--qmt-gap-coef", type=float, default=0.03)
@@ -195,17 +197,39 @@ def main():
     train_source_ids = sorted({source_id(row["vid"]) for row in train_rows})
     best_map, best_epoch = float("-inf"), None
     log_path = output_dir / "train_log.jsonl"
+    start_epoch, best_checkpoint, history = 1, None, []
+    contract = {k: v for k, v in vars(args).items()
+                if k not in ('output_dir', 'resume', 'save_last')}
+    contract['model_config'] = config
+    for split in ('train', 'dev'):
+        contract[split + '_sha256'] = hashlib.sha256(
+            Path(getattr(args, split + '_annotations')).read_bytes()).hexdigest()
+    if args.resume is not None:
+        from student_code.qmt.resume import restore_training_state
+        restored = restore_training_state(args.resume, model, optimizer, scheduler,
+                                          generator, contract)
+        start_epoch = restored['epoch'] + 1
+        best_map, best_epoch = restored['best_map'], restored['best_epoch']
+        best_checkpoint, history = restored['best_checkpoint'], restored['history']
+        if best_checkpoint is not None:
+            torch.save(best_checkpoint, output_dir / 'model_best.pt')
+        # 仅还原已完成epoch；不继承崩溃时写出的未提交日志。
+        log_path.write_text(''.join(json.dumps(r, ensure_ascii=False) + '\n'
+                                    for r in history), encoding='utf-8')
+        print(json.dumps({'resume_from': str(args.resume), 'next_epoch': start_epoch}), flush=True)
 
     def save_checkpoint(path, epoch, metrics):
-        torch.save({
+        payload = {
             "schema_version": 2,
             "model_family": "qmt_detr",
             "model": model.state_dict(), "epoch": epoch, "metrics": metrics,
             "model_config": config, "seed": args.seed, "train_qids": train_qids,
             "train_source_ids": train_source_ids,
-        }, path)
+        }
+        torch.save(payload, path)
+        return payload
 
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
         model.train()
         epoch_learning_rate = optimizer.param_groups[0]["lr"]
         epoch_losses = []
@@ -273,9 +297,21 @@ def main():
             if current_map > best_map:
                 best_map, best_epoch = current_map, epoch
                 save_checkpoint(output_dir / "model_best.pt", epoch, metrics)
+                if args.save_last or args.resume is not None:
+                    # 独立CPU副本避免最佳权重被后续optimizer更新原地污染。
+                    best_checkpoint = torch.load(output_dir / 'model_best.pt',
+                                                 map_location='cpu', weights_only=False)
         with log_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
         print(json.dumps(record, ensure_ascii=False), flush=True)
+        if args.save_last or args.resume is not None:
+            from student_code.qmt.resume import save_training_state
+            history.append(record)
+            save_training_state(output_dir / 'model_last.pt', model, optimizer,
+                                scheduler, generator, dict(
+                                    epoch=epoch, best_map=best_map, best_epoch=best_epoch,
+                                    best_checkpoint=best_checkpoint, history=history,
+                                    contract=contract))
     dump_json(output_dir / "summary.json", {
         "seed": args.seed, "best_epoch": best_epoch, "best_dev_mAP": best_map,
         "train_queries": len(train_rows), "dev_queries": len(dev_rows),
