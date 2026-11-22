@@ -20,9 +20,14 @@ class QMTDETR(MomentDETR):
                  qmt_trcc_temperature=0.02, qmt_trcc_context_scale=2.0,
                  qmt_bridge=False, qmt_iou_rank=False,
                  qmt_iou_score_weight=0.5, qmt_feature_gate=False, qmt_tcn=False,
-                 **kwargs):
+                 qmt_dense_foreground=False, **kwargs):
         super().__init__(*args, **kwargs)
         hidden_dim = self.transformer.d_model
+        self.qmt_dense_foreground = qmt_dense_foreground
+        if qmt_dense_foreground:
+            # 独立头不改变已有模块随机初始化；不参与候选导出。
+            with torch.random.fork_rng(devices=[]):
+                self.qmt_foreground_head = nn.Linear(hidden_dim, 1)
         self.qmt_cross_attn = qmt_cross_attn
         self.qmt_feature_gate = qmt_feature_gate
         self.qmt_tcn = qmt_tcn
@@ -292,6 +297,8 @@ class QMTDETR(MomentDETR):
             out.update(proj_queries=proj_queries[-1], proj_txt_mem=proj_txt_mem,
                        proj_vid_mem=proj_vid_mem)
         out["saliency_scores"] = saliency_scores
+        if self.qmt_dense_foreground:
+            out["foreground_logits"] = self.qmt_foreground_head(vid_mem).squeeze(-1)
         out["video_mask"] = src_vid_mask.bool()
         if self.qmt_bridge:
             # 最终层 query 与 encoder clip 位于同一隐藏空间；归一化后只监督方向相似度。
@@ -513,6 +520,7 @@ def build_qmt_model(args):
         qmt_cross_attn=getattr(args, "qmt_cross_attn", False),
         qmt_feature_gate=getattr(args, "qmt_feature_gate", False),
         qmt_tcn=getattr(args, "qmt_tcn", False),
+        qmt_dense_foreground=getattr(args, "qmt_dense_foreground", False),
         qmt_multiscale=getattr(args, "qmt_multiscale", False),
         qmt_num_heads=getattr(args, "qmt_num_heads", 8),
         qmt_dilations=getattr(args, "qmt_dilations", (1, 2, 4)),

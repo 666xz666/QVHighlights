@@ -19,6 +19,7 @@ from locator_common import (audit_features, discover_features, dump_json, make_d
                             model_config, predict)
 from prepare_course_data import assert_disjoint, read_jsonl, source_id, write_jsonl
 from student_code.qmt.model import build_qmt_model
+from student_code.qmt.foreground import foreground_losses
 
 
 def build_lr_scheduler(optimizer, epochs):
@@ -60,6 +61,10 @@ def parse_args():
     parser.add_argument("--qmt-cross-attn", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--qmt-feature-gate", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--qmt-tcn", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--qmt-dense-foreground", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--qmt-foreground-coef", type=float, default=0.1)
+    parser.add_argument("--qmt-gap-coef", type=float, default=0.03)
+    parser.add_argument("--qmt-gap-margin", type=float, default=0.2)
     parser.add_argument("--qmt-multiscale", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--qmt-hard-negative", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--qmt-num-heads", type=int, default=8)
@@ -91,6 +96,10 @@ def qmt_model_config(args):
         qmt_cross_attn=args.qmt_cross_attn,
         qmt_feature_gate=args.qmt_feature_gate,
         qmt_tcn=args.qmt_tcn,
+        qmt_dense_foreground=args.qmt_dense_foreground,
+        qmt_foreground_coef=args.qmt_foreground_coef,
+        qmt_gap_coef=args.qmt_gap_coef,
+        qmt_gap_margin=args.qmt_gap_margin,
         qmt_multiscale=args.qmt_multiscale,
         qmt_hard_negative=args.qmt_hard_negative,
         qmt_num_heads=args.qmt_num_heads,
@@ -148,6 +157,8 @@ def main():
     if args.qmt_iou_score_weight < 0:
         raise ValueError("--qmt-iou-score-weight must be non-negative")
     device = torch.device(args.device)
+    if min(args.qmt_foreground_coef, args.qmt_gap_coef, args.qmt_gap_margin) < 0:
+        raise ValueError("Foreground coefficients and margin must be non-negative")
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA unavailable")
     random.seed(args.seed)
@@ -162,6 +173,7 @@ def main():
     audit_features(layout, train_rows + dev_rows)
     config = qmt_model_config(args)
     train_set = make_dataset(args.train_annotations, layout, config, load_labels=True)
+    full_train_rows = {str(row["qid"]): row for row in train_rows}
     dev_set = make_dataset(args.dev_annotations, layout, config, load_labels=False)
     generator = torch.Generator().manual_seed(args.seed)
     train_loader = DataLoader(
@@ -197,6 +209,7 @@ def main():
         model.train()
         epoch_learning_rate = optimizer.param_groups[0]["lr"]
         epoch_losses = []
+        epoch_foreground_losses = []
         epoch_gates = []
         epoch_negative_query_losses = []
         start = time.time()
@@ -217,6 +230,14 @@ def main():
                 )
             loss = sum(loss_dict[key] * criterion.weight_dict[key]
                        for key in loss_dict if key in criterion.weight_dict)
+            if args.qmt_dense_foreground:
+                dense, gap = foreground_losses(
+                    outputs["foreground_logits"], model_inputs["src_vid_mask"],
+                    [full_train_rows[str(meta["qid"])] for meta in batch[0]],
+                    args.qmt_gap_margin,
+                )
+                loss = loss + args.qmt_foreground_coef * dense + args.qmt_gap_coef * gap
+                epoch_foreground_losses.append((float(dense.detach()), float(gap.detach())))
             if not torch.isfinite(loss):
                 raise RuntimeError(f"Non-finite loss at epoch {epoch}: {float(loss)}")
             optimizer.zero_grad(set_to_none=True)
@@ -232,6 +253,9 @@ def main():
             record["train_loss_qmt_negative_query"] = (
                 sum(epoch_negative_query_losses) / len(epoch_negative_query_losses)
             )
+        if epoch_foreground_losses:
+            record["foreground_bce"] = sum(x[0] for x in epoch_foreground_losses) / len(epoch_foreground_losses)
+            record["foreground_gap"] = sum(x[1] for x in epoch_foreground_losses) / len(epoch_foreground_losses)
         if epoch_gates:
             gates = torch.cat(epoch_gates)
             record["feature_gate"] = {
