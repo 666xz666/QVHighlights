@@ -61,6 +61,7 @@ def parse_args():
     parser.add_argument("--qmt-cross-attn", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--qmt-feature-gate", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--qmt-tcn", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument('--qmt-anchor-mode', choices=['none', 'uniform', 'multiscale'], default='none')
     parser.add_argument('--save-last', action='store_true', help='Save resumable epoch checkpoints')
     parser.add_argument('--resume', type=Path, help='Restore a trusted model_last.pt checkpoint')
     parser.add_argument("--qmt-dense-foreground", action=argparse.BooleanOptionalAction, default=False)
@@ -98,6 +99,7 @@ def qmt_model_config(args):
         qmt_cross_attn=args.qmt_cross_attn,
         qmt_feature_gate=args.qmt_feature_gate,
         qmt_tcn=args.qmt_tcn,
+        qmt_anchor_mode=getattr(args, 'qmt_anchor_mode', 'none'),
         qmt_dense_foreground=args.qmt_dense_foreground,
         qmt_foreground_coef=args.qmt_foreground_coef,
         qmt_gap_coef=args.qmt_gap_coef,

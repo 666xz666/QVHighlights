@@ -20,10 +20,11 @@ class QMTDETR(MomentDETR):
                  qmt_trcc_temperature=0.02, qmt_trcc_context_scale=2.0,
                  qmt_bridge=False, qmt_iou_rank=False,
                  qmt_iou_score_weight=0.5, qmt_feature_gate=False, qmt_tcn=False,
-                 qmt_dense_foreground=False, **kwargs):
+                 qmt_dense_foreground=False, qmt_anchor_mode='none', **kwargs):
         super().__init__(*args, **kwargs)
         hidden_dim = self.transformer.d_model
         self.qmt_dense_foreground = qmt_dense_foreground
+        self.qmt_anchor_mode = qmt_anchor_mode
         if qmt_dense_foreground:
             # 独立头不改变已有模块随机初始化；不参与候选导出。
             with torch.random.fork_rng(devices=[]):
@@ -96,6 +97,16 @@ class QMTDETR(MomentDETR):
                 ])
             nn.init.zeros_(self.qmt_tcn_layers[-1].weight)
             nn.init.zeros_(self.qmt_tcn_layers[-1].bias)
+
+        if qmt_anchor_mode != 'none':
+            from student_code.qmt.anchors import TemporalAnchors
+            if self.num_queries != 10 or self.span_loss_type != 'l1':
+                raise ValueError('Temporal anchors require 10 queries and l1 spans')
+            with torch.random.fork_rng(devices=[]):
+                self.qmt_anchors = TemporalAnchors(hidden_dim, qmt_anchor_mode)
+            # 锚点分支必须从零修正开始；关闭时不改变既有span头。
+            nn.init.zeros_(self.span_embed.layers[-1].weight)
+            nn.init.zeros_(self.span_embed.layers[-1].bias)
 
     def _temporal_residual(self, video, valid):
         """串联非因果卷积，逐层排除 padding，残差分支感受野为7个clip。
@@ -264,13 +275,18 @@ class QMTDETR(MomentDETR):
         mask = torch.cat([src_vid_mask, src_txt_mask], dim=1).bool()
         pos_vid = self.position_embed(src_vid, src_vid_mask)
         pos_txt = self.txt_position_embed(src_txt) if self.use_txt_pos else torch.zeros_like(src_txt)
-        hs, memory = self.transformer(
-            src, ~mask, self.query_embed.weight, torch.cat([pos_vid, pos_txt], dim=1),
-        )
+        if self.qmt_anchor_mode != 'none':
+            from student_code.qmt.anchors import decode_anchors
+            hs, memory, outputs_coord = decode_anchors(
+                self, src, ~mask, torch.cat([pos_vid, pos_txt], dim=1))
+        else:
+            hs, memory = self.transformer(
+                src, ~mask, self.query_embed.weight, torch.cat([pos_vid, pos_txt], dim=1),
+            )
+            outputs_coord = self.span_embed(hs)
+            if self.span_loss_type == 'l1':
+                outputs_coord = outputs_coord.sigmoid()
         outputs_class = self.class_embed(hs)
-        outputs_coord = self.span_embed(hs)
-        if self.span_loss_type == "l1":
-            outputs_coord = outputs_coord.sigmoid()
         txt_mem = memory[:, src_vid.shape[1]:]
         vid_mem = memory[:, :src_vid.shape[1]]
         saliency_scores = self.saliency_proj(vid_mem).squeeze(-1)
@@ -521,6 +537,7 @@ def build_qmt_model(args):
         qmt_feature_gate=getattr(args, "qmt_feature_gate", False),
         qmt_tcn=getattr(args, "qmt_tcn", False),
         qmt_dense_foreground=getattr(args, "qmt_dense_foreground", False),
+        qmt_anchor_mode=getattr(args, "qmt_anchor_mode", 'none'),
         qmt_multiscale=getattr(args, "qmt_multiscale", False),
         qmt_num_heads=getattr(args, "qmt_num_heads", 8),
         qmt_dilations=getattr(args, "qmt_dilations", (1, 2, 4)),
