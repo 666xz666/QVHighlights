@@ -59,6 +59,7 @@ def parse_args():
     parser.add_argument("--device", default="cuda", choices=["cuda", "cpu"])
     parser.add_argument("--qmt-cross-attn", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--qmt-feature-gate", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--qmt-tcn", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--qmt-multiscale", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--qmt-hard-negative", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--qmt-num-heads", type=int, default=8)
@@ -89,6 +90,7 @@ def qmt_model_config(args):
     config.update(
         qmt_cross_attn=args.qmt_cross_attn,
         qmt_feature_gate=args.qmt_feature_gate,
+        qmt_tcn=args.qmt_tcn,
         qmt_multiscale=args.qmt_multiscale,
         qmt_hard_negative=args.qmt_hard_negative,
         qmt_num_heads=args.qmt_num_heads,

@@ -19,12 +19,13 @@ class QMTDETR(MomentDETR):
                  qmt_gate_bias=-2.0, qmt_trcc=False,
                  qmt_trcc_temperature=0.02, qmt_trcc_context_scale=2.0,
                  qmt_bridge=False, qmt_iou_rank=False,
-                 qmt_iou_score_weight=0.5, qmt_feature_gate=False,
+                 qmt_iou_score_weight=0.5, qmt_feature_gate=False, qmt_tcn=False,
                  **kwargs):
         super().__init__(*args, **kwargs)
         hidden_dim = self.transformer.d_model
         self.qmt_cross_attn = qmt_cross_attn
         self.qmt_feature_gate = qmt_feature_gate
+        self.qmt_tcn = qmt_tcn
         self.qmt_multiscale = qmt_multiscale
         self.qmt_trcc = qmt_trcc
         self.qmt_bridge = qmt_bridge
@@ -80,6 +81,34 @@ class QMTDETR(MomentDETR):
                 )
             nn.init.zeros_(self.qmt_feature_gate_mlp[-1].weight)
             nn.init.zeros_(self.qmt_feature_gate_mlp[-1].bias)
+
+        if qmt_tcn:
+            # 独立随机流不改变对照模型的参数初始化与后续 dropout。
+            with torch.random.fork_rng(devices=[]):
+                self.qmt_tcn_layers = nn.ModuleList([
+                    nn.Conv1d(hidden_dim, hidden_dim, 3, padding=1, dilation=1),
+                    nn.Conv1d(hidden_dim, hidden_dim, 3, padding=2, dilation=2),
+                ])
+            nn.init.zeros_(self.qmt_tcn_layers[-1].weight)
+            nn.init.zeros_(self.qmt_tcn_layers[-1].bias)
+
+    def _temporal_residual(self, video, valid):
+        """串联非因果卷积，逐层排除 padding，残差分支感受野为7个clip。
+
+        Args:
+            video (Float[Tensor, "B V D"]): 投影后的视频特征。
+            valid (Bool[Tensor, "B V"]): True代表有效clip。
+
+        Returns:
+            Float[Tensor, "B V D"]: 恒等初始化的残差特征。
+        """
+        # 步骤1：卷积前和每层之后清零，避免偏置经padding传播回有效位置。
+        mask = valid[:, None, :].bool()
+        branch = video.transpose(1, 2).masked_fill(~mask, 0)
+        branch = F.relu(self.qmt_tcn_layers[0](branch)).masked_fill(~mask, 0)
+        branch = self.qmt_tcn_layers[1](branch).masked_fill(~mask, 0)
+        # 步骤2：保持残差输入不变；下游Transformer仍使用原视频掩码。
+        return video + branch.transpose(1, 2)
 
     def feature_gates(self, src_txt, src_txt_mask):
         """从有效原始文本特征计算两个模态缩放门，零初始化时恒为1。
@@ -224,6 +253,8 @@ class QMTDETR(MomentDETR):
         src_txt = self.input_txt_proj(src_txt)
         if self.qmt_cross_attn:
             src_vid = self._refine_video(src_vid, src_txt, src_txt_mask, src_vid_mask)
+        if self.qmt_tcn:
+            src_vid = self._temporal_residual(src_vid, src_vid_mask)
         src = torch.cat([src_vid, src_txt], dim=1)
         mask = torch.cat([src_vid_mask, src_txt_mask], dim=1).bool()
         pos_vid = self.position_embed(src_vid, src_vid_mask)
@@ -481,6 +512,7 @@ def build_qmt_model(args):
         n_input_proj=args.n_input_proj,
         qmt_cross_attn=getattr(args, "qmt_cross_attn", False),
         qmt_feature_gate=getattr(args, "qmt_feature_gate", False),
+        qmt_tcn=getattr(args, "qmt_tcn", False),
         qmt_multiscale=getattr(args, "qmt_multiscale", False),
         qmt_num_heads=getattr(args, "qmt_num_heads", 8),
         qmt_dilations=getattr(args, "qmt_dilations", (1, 2, 4)),

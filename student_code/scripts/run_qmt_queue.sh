@@ -18,6 +18,10 @@ case "$VARIANT" in
   cross) FLAGS=(--no-qmt-multiscale --no-qmt-hard-negative) ;;
   gate-only) FLAGS=(--no-qmt-cross-attn --no-qmt-multiscale --no-qmt-hard-negative --qmt-feature-gate) ;;
   cross-gate) FLAGS=(--no-qmt-multiscale --no-qmt-hard-negative --qmt-feature-gate) ;;
+  tcn-only) FLAGS=(--no-qmt-cross-attn --no-qmt-multiscale --no-qmt-hard-negative --qmt-tcn) ;;
+  cross-tcn) FLAGS=(--no-qmt-multiscale --no-qmt-hard-negative --qmt-tcn) ;;
+  cross-tcn-hard-negative) FLAGS=(--no-qmt-multiscale --qmt-hard-negative --qmt-tcn) ;;
+  gate-tcn) FLAGS=(--no-qmt-cross-attn --no-qmt-multiscale --no-qmt-hard-negative --qmt-feature-gate --qmt-tcn) ;;
   cross-multiscale) FLAGS=(--no-qmt-hard-negative) ;;
   off-multiscale) FLAGS=(--no-qmt-multiscale) ;;
   cross-neg-query) FLAGS=(--no-qmt-multiscale --no-qmt-hard-negative --qmt-negative-query) ;;

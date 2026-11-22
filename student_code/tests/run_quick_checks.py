@@ -3,10 +3,12 @@ from student_code.tests import test_ilr_objective as ilr
 from student_code.tests import test_ilr_data as ilr_data
 from student_code.tests import test_qmt_model as qmt
 from student_code.tests.test_feature_gate import test_feature_gate_contract
+from student_code.tests.test_tcn import test_tcn_contract
 
 
 def main():
     checks = [
+        test_tcn_contract,
         test_feature_gate_contract,
         ilr.test_first_answer_score_uses_pre_answer_logits_and_keeps_gradient,
         ilr.test_ilr_prefers_the_higher_iou_candidate,
