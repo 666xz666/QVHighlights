@@ -260,8 +260,8 @@ class QMTDETR(MomentDETR):
         ranked[..., 0] = ranked[..., 0] + self.qmt_iou_score_weight * correction
         return ranked
 
-    def forward(self, src_txt, src_txt_mask, src_vid, src_vid_mask):
-        """Run QMT-DETR with the same input/output contract as Moment-DETR."""
+    def forward(self, src_txt, src_txt_mask, src_vid, src_vid_mask, *, return_video_memory=False):
+        """Run QMT-DETR, optionally returning the [B V D] encoder video memory."""
         gates = self.feature_gates(src_txt, src_txt_mask) if self.qmt_feature_gate else None
         if gates is not None:
             src_vid = self._gate_features(src_vid, gates)
@@ -302,6 +302,8 @@ class QMTDETR(MomentDETR):
             if not self.training:
                 final_logits = self._apply_iou_ranking(final_logits, quality_logits)
         out = {"pred_logits": final_logits, "pred_spans": outputs_coord[-1]}
+        if return_video_memory:
+            out["video_memory"] = vid_mem
         if gates is not None:
             out["feature_gates"] = gates
         if quality_logits is not None:
